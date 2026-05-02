@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "asmk",
-    "faiss-cpu",
     "kagglehub>=1.0.1",
     "marker-pdf>=1.10.2",
     "numpy",
@@ -16,6 +15,14 @@ dependencies = [
     "pyaml",
     "scipy",
     "tqdm",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "faiss-cpu",
+]
+gpu = [
+    "faiss-gpu",
 ]
 
 [tool.uv.sources]

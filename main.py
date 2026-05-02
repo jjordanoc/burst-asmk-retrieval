@@ -862,5 +862,6 @@ if __name__ == "__main__":
         ),
         features=FeatureConfig(
             max_features_per_image=1500,
-        )
+        ),
+        asmk=ASMKConfig(gpu_id=0),
     ))
