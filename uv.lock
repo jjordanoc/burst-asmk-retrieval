@@ -518,6 +518,14 @@ wheels = [
 ]
 
 [[package]]
+name = "faiss-gpu"
+version = "1.7.2"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/71/623896382d90a9a99adf3438aa2c575535ba37804be9701d66f3337afd83/faiss_gpu-1.7.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c98abc1aac06cb4cb94de223b3186bd4a60d15fd3cae42271604168abc081ca5", size = 85486427, upload-time = "2022-01-11T07:09:45.751Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "3.29.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1677,7 +1685,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "asmk" },
-    { name = "faiss-cpu" },
     { name = "kagglehub" },
     { name = "marker-pdf" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1692,10 +1699,19 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.optional-dependencies]
+cpu = [
+    { name = "faiss-cpu" },
+]
+gpu = [
+    { name = "faiss-gpu" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "asmk", editable = "asmk" },
-    { name = "faiss-cpu" },
+    { name = "faiss-cpu", marker = "extra == 'cpu'" },
+    { name = "faiss-gpu", marker = "extra == 'gpu'" },
     { name = "kagglehub", specifier = ">=1.0.1" },
     { name = "marker-pdf", specifier = ">=1.10.2" },
     { name = "numpy" },
@@ -1706,6 +1722,7 @@ requires-dist = [
     { name = "scipy" },
     { name = "tqdm" },
 ]
+provides-extras = ["cpu", "gpu"]
 
 [[package]]
 name = "protobuf"
