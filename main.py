@@ -301,8 +301,12 @@ def load_or_extract_rootsift(image_path: Path, sift: cv2.SIFT, config: FeatureCo
             orientations=cached["orientations"].astype(np.float32),
             responses=cached["responses"].astype(np.float32),
         )
-
-    features = extract_rootsift(image_path, sift)
+    try:
+        features = extract_rootsift(image_path, sift)
+    except ValueError as error:
+        features = empty_feature_set()
+        print(f"[WARN] {error}")
+        return features
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         cache_path,
@@ -855,7 +859,7 @@ def run_pipeline(config: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 if __name__ == "__main__":
     run_pipeline(PipelineConfig(
-        descriptor_workers=16,
+        descriptor_workers=32,
         descriptor_chunksize=4,
         burst=BurstConfig(
             max_pairwise_features=1500,
