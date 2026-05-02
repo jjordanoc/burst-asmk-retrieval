@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import math
 import importlib
+import os
 import shutil
 import sys
 import tarfile
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -49,11 +52,6 @@ def notify_event(message: str) -> None:
 1. Dataset processing
 """
 
-import kagglehub
-
-path = kagglehub.dataset_download("skylord/oxbuildings", output_dir=f"{CONTENT_ROOT}/oxbuildings")
-
-
 
 @dataclass(frozen=True)
 class DatasetConfig:
@@ -62,6 +60,7 @@ class DatasetConfig:
     dataset_root: Path = Path(f"{CONTENT_ROOT}/dataset_unificado")
     metadata_csv: Path = Path(f"{CONTENT_ROOT}/dataset_unificado/metadata.csv")
     copy_files: bool = True
+    kaggle_dataset: str = "skylord/oxbuildings"
 
     @property
     def oxford_source(self) -> Path:
@@ -133,6 +132,13 @@ def extract_archives(config: DatasetConfig) -> None:
             safe_extract_tar(tar, output_dir)
 
 
+def download_kaggle_dataset(config: DatasetConfig) -> None:
+    import kagglehub
+
+    config.archive_dir.mkdir(parents=True, exist_ok=True)
+    kagglehub.dataset_download(config.kaggle_dataset, output_dir=str(config.archive_dir))
+
+
 def build_unified_dataset(config: DatasetConfig) -> pd.DataFrame:
     config.dataset_root.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, str]] = []
@@ -188,6 +194,8 @@ def build_unified_dataset(config: DatasetConfig) -> pd.DataFrame:
 
 def load_or_build_metadata(config: DatasetConfig, rebuild: bool = False) -> pd.DataFrame:
     if rebuild or not config.metadata_csv.exists():
+        if not config.archive_dir.exists() or not any(config.archive_dir.iterdir()):
+            download_kaggle_dataset(config)
         if config.archive_dir.exists():
             extract_archives(config)
         return build_unified_dataset(config)
@@ -418,6 +426,22 @@ class DescriptorTable:
 
 
 @dataclass(frozen=True)
+class ImageDescriptorTask:
+    dataset: str
+    class_name: str
+    img_name: str
+    img_path: str
+
+
+@dataclass(frozen=True)
+class ImageDescriptorResult:
+    task: ImageDescriptorTask
+    db_descriptors: FloatMatrix
+    query_descriptors: FloatMatrix
+    skip_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
@@ -428,6 +452,8 @@ class PipelineConfig:
     aggregate_queries: bool = False
     random_seed: int = 0
     results_topk: int = 50
+    descriptor_workers: int | None = None
+    descriptor_chunksize: int = 4
 
 
 def import_asmk_method() -> type:
@@ -455,14 +481,106 @@ def concatenate_ids(chunks: list[IntVector]) -> IntVector:
     return np.concatenate(chunks).astype(np.int64)
 
 
+def resolve_descriptor_workers(requested_workers: int | None) -> int:
+    if requested_workers is not None:
+        if requested_workers < 1:
+            raise ValueError(f"descriptor_workers must be >= 1, got {requested_workers}")
+        return requested_workers
+
+    cpu_count = os.cpu_count()
+    if cpu_count is None:
+        return 1
+    return max(1, min(cpu_count - 1, 8))
+
+
+def metadata_to_descriptor_tasks(metadata: pd.DataFrame) -> list[ImageDescriptorTask]:
+    return [
+        ImageDescriptorTask(
+            dataset=str(row.dataset),
+            class_name=str(row.class_name),
+            img_name=str(row.img_name),
+            img_path=str(row.img_path),
+        )
+        for row in metadata.itertuples(index=False)
+    ]
+
+
+def process_image_descriptors(
+    args: tuple[ImageDescriptorTask, FeatureConfig, BurstConfig, bool],
+) -> ImageDescriptorResult:
+    task, feature_config, burst_config, aggregate_queries = args
+    cv2.setNumThreads(1)
+    sift = create_sift(feature_config)
+    image_path = Path(task.img_path)
+
+    features = load_or_extract_rootsift(image_path, sift, feature_config)
+    if features.descriptors.shape[0] == 0:
+        return ImageDescriptorResult(
+            task=task,
+            db_descriptors=empty_feature_set().descriptors,
+            query_descriptors=empty_feature_set().descriptors,
+            skip_reason="no SIFT features",
+        )
+
+    db_descriptors = aggregate_bursts(features, burst_config)
+    query_descriptors = db_descriptors if aggregate_queries else features.descriptors
+    if db_descriptors.shape[0] == 0 or query_descriptors.shape[0] == 0:
+        return ImageDescriptorResult(
+            task=task,
+            db_descriptors=db_descriptors,
+            query_descriptors=query_descriptors,
+            skip_reason="empty descriptor aggregation",
+        )
+
+    return ImageDescriptorResult(
+        task=task,
+        db_descriptors=db_descriptors,
+        query_descriptors=query_descriptors.astype(np.float32),
+    )
+
+
+def iter_descriptor_results(
+    tasks: list[ImageDescriptorTask],
+    feature_config: FeatureConfig,
+    burst_config: BurstConfig,
+    aggregate_queries: bool,
+    max_workers: int,
+    chunksize: int,
+) -> Iterator[ImageDescriptorResult]:
+    if chunksize < 1:
+        raise ValueError(f"descriptor_chunksize must be >= 1, got {chunksize}")
+
+    worker_args = (
+        (task, feature_config, burst_config, aggregate_queries)
+        for task in tasks
+    )
+    if max_workers == 1:
+        for args in tqdm(
+            worker_args,
+            total=len(tasks),
+            desc="Extract RootSIFT + Shi bursts",
+        ):
+            yield process_image_descriptors(args)
+        return
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        yield from tqdm(
+            executor.map(process_image_descriptors, worker_args, chunksize=chunksize),
+            total=len(tasks),
+            desc=f"Extract RootSIFT + Shi bursts ({max_workers} workers)",
+        )
+
+
 def build_descriptor_tables(
     metadata: pd.DataFrame,
     feature_config: FeatureConfig,
     burst_config: BurstConfig,
     aggregate_queries: bool,
+    descriptor_workers: int | None = None,
+    descriptor_chunksize: int = 4,
 ) -> tuple[pd.DataFrame, DescriptorTable, DescriptorTable]:
     validate_metadata(metadata)
-    sift = create_sift(feature_config)
+    max_workers = resolve_descriptor_workers(descriptor_workers)
 
     valid_records: list[dict[str, object]] = []
     db_descriptor_chunks: list[FloatMatrix] = []
@@ -470,34 +588,34 @@ def build_descriptor_tables(
     query_descriptor_chunks: list[FloatMatrix] = []
     query_id_chunks: list[IntVector] = []
 
-    rows = list(metadata.itertuples(index=False))
-    for row in tqdm(rows, desc="Extract RootSIFT + Shi bursts"):
-        image_path = Path(row.img_path)
-        features = load_or_extract_rootsift(image_path, sift, feature_config)
-        if features.descriptors.shape[0] == 0:
-            print(f"[WARN] Skipping image with no SIFT features: {image_path}")
-            continue
-
-        db_descriptors = aggregate_bursts(features, burst_config)
-        query_descriptors = db_descriptors if aggregate_queries else features.descriptors
-        if db_descriptors.shape[0] == 0 or query_descriptors.shape[0] == 0:
-            print(f"[WARN] Skipping image after empty descriptor aggregation: {image_path}")
+    tasks = metadata_to_descriptor_tasks(metadata)
+    results = iter_descriptor_results(
+        tasks,
+        feature_config,
+        burst_config,
+        aggregate_queries,
+        max_workers=max_workers,
+        chunksize=descriptor_chunksize,
+    )
+    for result in results:
+        if result.skip_reason is not None:
+            print(f"[WARN] Skipping {result.task.img_path}: {result.skip_reason}")
             continue
 
         image_id = len(valid_records)
         valid_records.append(
             {
                 "image_id": image_id,
-                "dataset": row.dataset,
-                "class_name": row.class_name,
-                "img_name": row.img_name,
-                "img_path": str(image_path),
+                "dataset": result.task.dataset,
+                "class_name": result.task.class_name,
+                "img_name": result.task.img_name,
+                "img_path": result.task.img_path,
             }
         )
-        db_descriptor_chunks.append(db_descriptors)
-        db_id_chunks.append(np.full(db_descriptors.shape[0], image_id, dtype=np.int64))
-        query_descriptor_chunks.append(query_descriptors.astype(np.float32))
-        query_id_chunks.append(np.full(query_descriptors.shape[0], image_id, dtype=np.int64))
+        db_descriptor_chunks.append(result.db_descriptors)
+        db_id_chunks.append(np.full(result.db_descriptors.shape[0], image_id, dtype=np.int64))
+        query_descriptor_chunks.append(result.query_descriptors)
+        query_id_chunks.append(np.full(result.query_descriptors.shape[0], image_id, dtype=np.int64))
 
     valid_metadata = pd.DataFrame(valid_records)
     if valid_metadata.empty:
@@ -705,6 +823,8 @@ def run_pipeline(config: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
         config.features,
         config.burst,
         aggregate_queries=config.aggregate_queries,
+        descriptor_workers=config.descriptor_workers,
+        descriptor_chunksize=config.descriptor_chunksize,
     )
     valid_metadata.to_csv(config.output_dir / "valid_metadata.csv", index=False)
 
@@ -734,4 +854,13 @@ def run_pipeline(config: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 if __name__ == "__main__":
-    run_pipeline(PipelineConfig())
+    run_pipeline(PipelineConfig(
+        descriptor_workers=16,
+        descriptor_chunksize=4,
+        burst=BurstConfig(
+            max_pairwise_features=1500,
+        ),
+        features=FeatureConfig(
+            max_features_per_image=1500,
+        )
+    ))
