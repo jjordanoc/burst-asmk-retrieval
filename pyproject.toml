@@ -1,0 +1,22 @@
+[project]
+name = "project1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "asmk",
+    "faiss-cpu",
+    "kagglehub>=1.0.1",
+    "marker-pdf>=1.10.2",
+    "numpy",
+    "opencv-contrib-python-headless",
+    "pandas",
+    "psutil>=7.2.2",
+    "pyaml",
+    "scipy",
+    "tqdm",
+]
+
+[tool.uv.sources]
+asmk = { path = "asmk", editable = true }
