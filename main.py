@@ -577,6 +577,7 @@ class ASMKConfig:
     query_multiple_assignment: int = 5  # paper
     similarity_threshold: float = 0.0  # paper
     alpha: float = 3.0  # paper
+    # None = rank full database per query (mAP/eval). Integer = truncate ASMK IVF search depth.
     topk: int | None = None
     train_sample_size: int = 250_000
     cache_dir: Path = Path(f"{CONTENT_ROOT}/cache/asmk")
@@ -632,6 +633,7 @@ class PipelineConfig:
     rebuild_metadata: bool = False
     aggregate_queries: bool = False
     random_seed: int = 0
+    # How many retrieval rows per query are written to retrieval_results.csv (and vis.csv cap).
     results_topk: int = 50
     descriptor_workers: int | None = None
     descriptor_chunksize: int = 4
@@ -1345,10 +1347,10 @@ if __name__ == "__main__":
         asmk=ASMKConfig(
             gpu_id=0,
             # gpu_id=None,
-            # codebook_size=65536,
-            codebook_size=16384,
-            # train_sample_size=2_600_000,
-            train_sample_size=700_000,
+            codebook_size=65536,
+            # codebook_size=16384,
+            train_sample_size=2_600_000,
+            # train_sample_size=700_000,
         ),
         burst=BurstConfig(tau=0.990),
     ))
