@@ -306,13 +306,12 @@ def extract_hesaff_rootsift(image_path: Path, config: FeatureConfig) -> FeatureS
             "FeatureConfig.detector='hesaff' requires pyhesaff. "
             "Install it or set FeatureConfig(detector='sift')."
         ) from error
-
-    if hasattr(pyhesaff, "detect_feats"):
+    try:
         result = pyhesaff.detect_feats(str(image_path))
-    elif hasattr(pyhesaff, "extract_features"):
-        result = pyhesaff.extract_features(str(image_path))
-    else:
-        raise AttributeError("pyhesaff has neither detect_feats nor extract_features.")
+    except Exception as error:
+        print(f"[WARN] pyhesaff failed to detect features: {error}")
+        return empty_feature_set()
+    
     if not isinstance(result, tuple) or len(result) < 2:
         raise ValueError(f"pyhesaff returned an invalid feature tuple: {type(result)}")
     keypoints, descriptors = result[:2]
@@ -358,14 +357,14 @@ def extract_features(image_path: Path, sift: cv2.SIFT | None, config: FeatureCon
         return features
     if features.descriptors.shape[0] <= config.max_features_per_image:
         return features
-    strongest = np.argsort(-features.responses)[: config.max_features_per_image]
-    strongest.sort()
+    # strongest = np.argsort(-features.responses)[: config.max_features_per_image]
+    # strongest.sort()
     return FeatureSet(
-        descriptors=features.descriptors[strongest],
-        positions=features.positions[strongest],
-        scales=features.scales[strongest],
-        orientations=features.orientations[strongest],
-        responses=features.responses[strongest],
+        descriptors=features.descriptors,
+        positions=features.positions,
+        scales=features.scales,
+        orientations=features.orientations,
+        responses=features.responses,
     )
 
 
@@ -653,7 +652,7 @@ def process_image_descriptors(
             task=task,
             db_descriptors=empty_feature_set().descriptors,
             query_descriptors=empty_feature_set().descriptors,
-            skip_reason="no SIFT features",
+            skip_reason="no valid features",
         )
 
     db_descriptors = aggregate_bursts(features, burst_config, tau=tau)
@@ -1269,5 +1268,8 @@ if __name__ == "__main__":
     run_pipeline(PipelineConfig(
         descriptor_workers=32,
         descriptor_chunksize=4,
-        asmk=ASMKConfig(gpu_id=0),
+        asmk=ASMKConfig(gpu_id=0,
+        codebook_size=16384,
+        train_sample_size=500_000),
+        burst=BurstConfig(tau=0.990),
     ))
