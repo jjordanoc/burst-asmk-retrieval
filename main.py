@@ -28,6 +28,7 @@ from scipy.sparse.csgraph import connected_components
 from tqdm.auto import tqdm
 
 
+
 PROJECT_ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 LOCAL_ASMK_ROOT = PROJECT_ROOT / "asmk"
 CONTENT_ROOT = "./content"
@@ -226,7 +227,7 @@ IntVector = NDArray[np.int64]
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    max_features_per_image: int = 3000
+    max_features_per_image: int | None = None
     contrast_threshold: float = 0.01
     edge_threshold: float = 10.0
     cache_dir: Path = Path(f"{CONTENT_ROOT}/cache/features")
@@ -244,7 +245,7 @@ class FeatureSet:
 
 def create_sift(config: FeatureConfig) -> cv2.SIFT:
     return cv2.SIFT_create(
-        nfeatures=config.max_features_per_image,
+        nfeatures=0 if config.max_features_per_image is None else config.max_features_per_image,
         contrastThreshold=config.contrast_threshold,
         edgeThreshold=config.edge_threshold,
     )
@@ -275,7 +276,8 @@ def empty_feature_set(dim: int = 128) -> FeatureSet:
 
 def feature_cache_path(image_path: Path, config: FeatureConfig) -> Path:
     safe_name = str(image_path).strip("/").replace("/", "__")
-    cache_name = f"max{config.max_features_per_image}_{safe_name}.npz"
+    feature_limit = "all" if config.max_features_per_image is None else f"max{config.max_features_per_image}"
+    cache_name = f"{feature_limit}_{safe_name}.npz"
     return config.cache_dir / config.detector / cache_name
 
 
@@ -352,6 +354,8 @@ def extract_features(image_path: Path, sift: cv2.SIFT | None, config: FeatureCon
     else:
         raise ValueError(f"Unknown feature detector: {config.detector}")
 
+    if config.max_features_per_image is None:
+        return features
     if features.descriptors.shape[0] <= config.max_features_per_image:
         return features
     strongest = np.argsort(-features.responses)[: config.max_features_per_image]
@@ -408,10 +412,12 @@ class BurstConfig:
     use_orientation_kernel: bool = True  # paper: Oxford/Paris
     scale_lambda: float = 1.0  # paper
     orientation_kappa: float = 4.0  # paper
-    max_pairwise_features: int = 3000
+    max_pairwise_features: int | None = None
 
 
-def keep_strongest_features(features: FeatureSet, max_features: int) -> FeatureSet:
+def keep_strongest_features(features: FeatureSet, max_features: int | None) -> FeatureSet:
+    if max_features is None:
+        return features
     if features.descriptors.shape[0] <= max_features:
         return features
 
@@ -534,7 +540,7 @@ class CalibrationConfig:
     sample_size: int = 100
     seed: int = 0
     target_aggregation: float = 0.85
-    tau_grid: tuple[float, ...] = (0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9)
+    tau_grid: tuple[float, ...] = (0.5, 0.8, 0.9, 0.95, 0.97, 0.98, 0.99)
 
 
 @dataclass(frozen=True)
@@ -1263,11 +1269,5 @@ if __name__ == "__main__":
     run_pipeline(PipelineConfig(
         descriptor_workers=32,
         descriptor_chunksize=4,
-        burst=BurstConfig(
-            max_pairwise_features=1500,
-        ),
-        features=FeatureConfig(
-            max_features_per_image=1500,
-        ),
         asmk=ASMKConfig(gpu_id=0),
     ))
