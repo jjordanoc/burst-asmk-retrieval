@@ -8,6 +8,7 @@ after the Oxford/Paris archives are available in the configured Colab paths.
 from __future__ import annotations
 
 import math
+import hashlib
 import importlib
 import os
 import shutil
@@ -412,6 +413,53 @@ class BurstConfig:
     scale_lambda: float = 1.0  # paper
     orientation_kappa: float = 4.0  # paper
     max_pairwise_features: int | None = None
+    cache_dir: Path = Path(f"{CONTENT_ROOT}/cache/bursts")
+
+
+def burst_cache_path(
+    image_path: Path,
+    feature_config: FeatureConfig,
+    burst_config: BurstConfig,
+    tau: float | None,
+) -> Path:
+    safe_name = str(image_path).strip("/").replace("/", "__")
+    feature_limit = (
+        "all" if feature_config.max_features_per_image is None else f"max{feature_config.max_features_per_image}"
+    )
+    signature_parts = (
+        "v1",
+        feature_config.detector,
+        feature_limit,
+        feature_config.contrast_threshold,
+        feature_config.edge_threshold,
+        tau,
+        burst_config.descriptor_sigmoid_b,
+        burst_config.descriptor_sigmoid_w,
+        burst_config.use_scale_kernel,
+        burst_config.use_orientation_kernel,
+        burst_config.scale_lambda,
+        burst_config.orientation_kappa,
+        burst_config.max_pairwise_features,
+    )
+    signature = hashlib.sha1(repr(signature_parts).encode("utf-8")).hexdigest()[:16]
+    return burst_config.cache_dir / feature_config.detector / f"{signature}_{safe_name}.npz"
+
+
+def load_cached_burst_descriptors(cache_path: Path) -> tuple[FloatMatrix, int] | None:
+    if not cache_path.exists():
+        return None
+
+    with np.load(cache_path) as cached:
+        return cached["descriptors"].astype(np.float32), int(cached["n_features"])
+
+
+def save_cached_burst_descriptors(cache_path: Path, descriptors: FloatMatrix, n_features: int) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        descriptors=descriptors.astype(np.float32),
+        n_features=np.array(n_features, dtype=np.int64),
+    )
 
 
 def keep_strongest_features(features: FeatureSet, max_features: int | None) -> FeatureSet:
@@ -645,6 +693,27 @@ def process_image_descriptors(
     cv2.setNumThreads(1)
     sift = create_sift(feature_config) if feature_config.detector == "sift" else None
     image_path = Path(task.img_path)
+    burst_cache = load_cached_burst_descriptors(
+        burst_cache_path(image_path, feature_config, burst_config, tau)
+    )
+    if burst_cache is not None:
+        db_descriptors, n_features = burst_cache
+        if db_descriptors.shape[0] == 0:
+            return ImageDescriptorResult(
+                task=task,
+                db_descriptors=db_descriptors,
+                query_descriptors=empty_feature_set().descriptors,
+                n_features=n_features,
+                n_aggregated=0,
+                skip_reason="empty descriptor aggregation",
+            )
+        return ImageDescriptorResult(
+            task=task,
+            db_descriptors=db_descriptors,
+            query_descriptors=empty_feature_set().descriptors,
+            n_features=n_features,
+            n_aggregated=db_descriptors.shape[0],
+        )
 
     features = load_or_extract_rootsift(image_path, sift, feature_config)
     if features.descriptors.shape[0] == 0:
@@ -656,6 +725,11 @@ def process_image_descriptors(
         )
 
     db_descriptors = aggregate_bursts(features, burst_config, tau=tau)
+    save_cached_burst_descriptors(
+        burst_cache_path(image_path, feature_config, burst_config, tau),
+        db_descriptors,
+        features.descriptors.shape[0],
+    )
     if db_descriptors.shape[0] == 0:
         return ImageDescriptorResult(
             task=task,
@@ -1268,8 +1342,13 @@ if __name__ == "__main__":
     run_pipeline(PipelineConfig(
         descriptor_workers=32,
         descriptor_chunksize=4,
-        asmk=ASMKConfig(gpu_id=0,
-        codebook_size=16384,
-        train_sample_size=500_000),
+        asmk=ASMKConfig(
+            gpu_id=0,
+            # gpu_id=None,
+            # codebook_size=65536,
+            codebook_size=16384,
+            # train_sample_size=2_600_000,
+            train_sample_size=700_000,
+        ),
         burst=BurstConfig(tau=0.990),
     ))

@@ -23,7 +23,7 @@ cpu = [
     "faiss-cpu",
 ]
 gpu = [
-    "faiss-gpu",
+    "faiss-gpu-cu12",
 ]
 
 [tool.uv.sources]
