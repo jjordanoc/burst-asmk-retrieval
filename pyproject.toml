@@ -6,11 +6,13 @@ readme = "README.md"
 requires-python = "==3.10.*"
 dependencies = [
     "asmk",
+    "gradio>=4",
     "kagglehub>=1.0.1",
     "marker-pdf>=1.10.2",
     "numpy<2",
     "opencv-contrib-python-headless",
     "pandas",
+    "pillow",
     "psutil>=7.2.2",
     "pyaml",
     "pyhesaff",
