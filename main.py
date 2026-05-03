@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 import cv2
 import numpy as np
@@ -230,11 +230,13 @@ class FeatureConfig:
     contrast_threshold: float = 0.01
     edge_threshold: float = 10.0
     cache_dir: Path = Path(f"{CONTENT_ROOT}/cache/features")
+    detector: Literal["hesaff", "sift"] = "hesaff"
 
 
 @dataclass(frozen=True)
 class FeatureSet:
     descriptors: FloatMatrix
+    positions: FloatMatrix
     scales: FloatVector
     orientations: FloatVector
     responses: FloatVector
@@ -264,6 +266,7 @@ def rootsift(sift_descriptors: FloatMatrix, eps: float = 1e-12) -> FloatMatrix:
 def empty_feature_set(dim: int = 128) -> FeatureSet:
     return FeatureSet(
         descriptors=np.empty((0, dim), dtype=np.float32),
+        positions=np.empty((0, 2), dtype=np.float32),
         scales=np.empty((0,), dtype=np.float32),
         orientations=np.empty((0,), dtype=np.float32),
         responses=np.empty((0,), dtype=np.float32),
@@ -272,10 +275,11 @@ def empty_feature_set(dim: int = 128) -> FeatureSet:
 
 def feature_cache_path(image_path: Path, config: FeatureConfig) -> Path:
     safe_name = str(image_path).strip("/").replace("/", "__")
-    return config.cache_dir / f"{safe_name}.npz"
+    cache_name = f"max{config.max_features_per_image}_{safe_name}.npz"
+    return config.cache_dir / config.detector / cache_name
 
 
-def extract_rootsift(image_path: Path, sift: cv2.SIFT) -> FeatureSet:
+def extract_sift_rootsift(image_path: Path, sift: cv2.SIFT) -> FeatureSet:
     image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise ValueError(f"OpenCV could not read image: {image_path}")
@@ -285,24 +289,95 @@ def extract_rootsift(image_path: Path, sift: cv2.SIFT) -> FeatureSet:
         return empty_feature_set()
 
     root_descriptors = rootsift(descriptors)
+    positions = np.array([kp.pt for kp in keypoints], dtype=np.float32)
     scales = np.array([kp.size for kp in keypoints], dtype=np.float32)
     orientations = np.deg2rad(np.array([kp.angle if kp.angle >= 0 else 0.0 for kp in keypoints]))
     responses = np.array([kp.response for kp in keypoints], dtype=np.float32)
-    return FeatureSet(root_descriptors, scales, orientations.astype(np.float32), responses)
+    return FeatureSet(root_descriptors, positions, scales, orientations.astype(np.float32), responses)
 
 
-def load_or_extract_rootsift(image_path: Path, sift: cv2.SIFT, config: FeatureConfig) -> FeatureSet:
+def extract_hesaff_rootsift(image_path: Path, config: FeatureConfig) -> FeatureSet:
+    try:
+        pyhesaff = importlib.import_module("pyhesaff")
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            "FeatureConfig.detector='hesaff' requires pyhesaff. "
+            "Install it or set FeatureConfig(detector='sift')."
+        ) from error
+
+    if hasattr(pyhesaff, "detect_feats"):
+        result = pyhesaff.detect_feats(str(image_path))
+    elif hasattr(pyhesaff, "extract_features"):
+        result = pyhesaff.extract_features(str(image_path))
+    else:
+        raise AttributeError("pyhesaff has neither detect_feats nor extract_features.")
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise ValueError(f"pyhesaff returned an invalid feature tuple: {type(result)}")
+    keypoints, descriptors = result[:2]
+
+    if descriptors is None or keypoints is None or len(keypoints) == 0:
+        return empty_feature_set()
+
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    descriptors = np.asarray(descriptors, dtype=np.float32)
+    if descriptors.ndim != 2 or descriptors.shape[1] != 128:
+        raise ValueError(f"pyhesaff returned descriptors with invalid shape: {descriptors.shape}")
+    if keypoints.ndim != 2 or keypoints.shape[1] < 2:
+        raise ValueError(f"pyhesaff returned keypoints with invalid shape: {keypoints.shape}")
+
+    positions = keypoints[:, :2].astype(np.float32)
+    if keypoints.shape[1] >= 5:
+        a11 = keypoints[:, 2]
+        a21 = keypoints[:, 3]
+        a22 = keypoints[:, 4]
+        determinant = np.maximum(a11 * a22 - np.square(a21), 1e-12)
+        scales = np.sqrt(1.0 / np.sqrt(determinant)).astype(np.float32)
+    else:
+        scales = np.ones((keypoints.shape[0],), dtype=np.float32)
+    if keypoints.shape[1] >= 6:
+        orientations = keypoints[:, 5].astype(np.float32)
+    else:
+        orientations = np.zeros((keypoints.shape[0],), dtype=np.float32)
+    responses = scales.astype(np.float32)
+    return FeatureSet(rootsift(descriptors), positions, scales, orientations, responses)
+
+
+def extract_features(image_path: Path, sift: cv2.SIFT | None, config: FeatureConfig) -> FeatureSet:
+    if config.detector == "hesaff":
+        features = extract_hesaff_rootsift(image_path, config)
+    elif config.detector == "sift":
+        if sift is None:
+            raise ValueError("SIFT detector object is required when FeatureConfig.detector='sift'.")
+        features = extract_sift_rootsift(image_path, sift)
+    else:
+        raise ValueError(f"Unknown feature detector: {config.detector}")
+
+    if features.descriptors.shape[0] <= config.max_features_per_image:
+        return features
+    strongest = np.argsort(-features.responses)[: config.max_features_per_image]
+    strongest.sort()
+    return FeatureSet(
+        descriptors=features.descriptors[strongest],
+        positions=features.positions[strongest],
+        scales=features.scales[strongest],
+        orientations=features.orientations[strongest],
+        responses=features.responses[strongest],
+    )
+
+
+def load_or_extract_rootsift(image_path: Path, sift: cv2.SIFT | None, config: FeatureConfig) -> FeatureSet:
     cache_path = feature_cache_path(image_path, config)
     if cache_path.exists():
         cached = np.load(cache_path)
         return FeatureSet(
             descriptors=cached["descriptors"].astype(np.float32),
+            positions=cached["positions"].astype(np.float32),
             scales=cached["scales"].astype(np.float32),
             orientations=cached["orientations"].astype(np.float32),
             responses=cached["responses"].astype(np.float32),
         )
     try:
-        features = extract_rootsift(image_path, sift)
+        features = extract_features(image_path, sift, config)
     except ValueError as error:
         features = empty_feature_set()
         print(f"[WARN] {error}")
@@ -311,6 +386,7 @@ def load_or_extract_rootsift(image_path: Path, sift: cv2.SIFT, config: FeatureCo
     np.savez_compressed(
         cache_path,
         descriptors=features.descriptors,
+        positions=features.positions,
         scales=features.scales,
         orientations=features.orientations,
         responses=features.responses,
@@ -325,11 +401,13 @@ def load_or_extract_rootsift(image_path: Path, sift: cv2.SIFT, config: FeatureCo
 
 @dataclass(frozen=True)
 class BurstConfig:
-    affinity_threshold: float = 0.78
-    use_scale_kernel: bool = True
-    use_orientation_kernel: bool = True
-    scale_lambda: float = 1.0
-    orientation_kappa: float = 4.0
+    tau: float | None = None
+    descriptor_sigmoid_b: float = 0.78  # paper
+    descriptor_sigmoid_w: float = 35.0  # paper
+    use_scale_kernel: bool = True  # paper
+    use_orientation_kernel: bool = True  # paper: Oxford/Paris
+    scale_lambda: float = 1.0  # paper
+    orientation_kappa: float = 4.0  # paper
     max_pairwise_features: int = 3000
 
 
@@ -341,10 +419,25 @@ def keep_strongest_features(features: FeatureSet, max_features: int) -> FeatureS
     strongest.sort()
     return FeatureSet(
         descriptors=features.descriptors[strongest],
+        positions=features.positions[strongest],
         scales=features.scales[strongest],
         orientations=features.orientations[strongest],
         responses=features.responses[strongest],
     )
+
+
+def validate_burst_config(config: BurstConfig) -> None:
+    if config.tau is not None and not 0.0 <= config.tau <= 1.0:
+        raise ValueError(f"config.tau must be in [0, 1], got {config.tau}")
+    if config.descriptor_sigmoid_w <= 0:
+        raise ValueError(
+            f"config.descriptor_sigmoid_w must be positive, got {config.descriptor_sigmoid_w}"
+        )
+
+
+def descriptor_kernel(inner_products: FloatMatrix, b: float, w: float) -> FloatMatrix:
+    logits = np.clip(w * (inner_products.astype(np.float32) - b), -80.0, 80.0)
+    return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
 
 
 def scale_affinity(scales: FloatVector, scale_lambda: float) -> FloatMatrix:
@@ -364,8 +457,14 @@ def orientation_affinity(orientations: FloatVector, kappa: float) -> FloatMatrix
 
 
 def burst_affinity_matrix(features: FeatureSet, config: BurstConfig) -> FloatMatrix:
+    validate_burst_config(config)
     descriptors = l2_normalize_rows(features.descriptors)
-    affinity = np.clip(descriptors @ descriptors.T, 0.0, 1.0).astype(np.float32)
+    inner_products = np.clip(descriptors @ descriptors.T, 0.0, 1.0).astype(np.float32)
+    affinity = descriptor_kernel(
+        inner_products,
+        b=config.descriptor_sigmoid_b,
+        w=config.descriptor_sigmoid_w,
+    )
 
     if config.use_scale_kernel:
         affinity *= scale_affinity(features.scales, config.scale_lambda)
@@ -376,7 +475,14 @@ def burst_affinity_matrix(features: FeatureSet, config: BurstConfig) -> FloatMat
     return affinity
 
 
-def aggregate_bursts(features: FeatureSet, config: BurstConfig) -> FloatMatrix:
+def burst_tau(config: BurstConfig, fallback_tau: float) -> float:
+    tau = fallback_tau if config.tau is None else config.tau
+    if not 0.0 <= tau <= 1.0:
+        raise ValueError(f"Burst threshold tau must be in [0, 1], got {tau}")
+    return tau
+
+
+def aggregate_bursts(features: FeatureSet, config: BurstConfig, tau: float | None = None) -> FloatMatrix:
     """
     Return Shi-style descriptors with shape [n_aggregated, 128].
 
@@ -391,7 +497,7 @@ def aggregate_bursts(features: FeatureSet, config: BurstConfig) -> FloatMatrix:
         return bounded_features.descriptors
 
     affinity = burst_affinity_matrix(bounded_features, config)
-    adjacency = sparse.csr_matrix(affinity >= config.affinity_threshold)
+    adjacency = sparse.csr_matrix(affinity >= burst_tau(config, fallback_tau=0.5 if tau is None else tau))
     _n_components, labels = connected_components(adjacency, directed=False)
 
     aggregated: list[FloatVector] = []
@@ -410,17 +516,31 @@ def aggregate_bursts(features: FeatureSet, config: BurstConfig) -> FloatMatrix:
 
 @dataclass(frozen=True)
 class ASMKConfig:
-    codebook_size: int = 4096
+    codebook_size: int = 65_536  # paper
     gpu_id: int | None = None
-    binary: bool = False
-    use_idf: bool = True
-    db_multiple_assignment: int = 1
-    query_multiple_assignment: int = 5
-    similarity_threshold: float = 0.0
-    alpha: float = 3.0
+    binary: bool = True  # paper: ASMK*
+    use_idf: bool = True  # paper
+    db_multiple_assignment: int = 1  # paper
+    query_multiple_assignment: int = 5  # paper
+    similarity_threshold: float = 0.0  # paper
+    alpha: float = 3.0  # paper
     topk: int | None = None
     train_sample_size: int = 250_000
     cache_dir: Path = Path(f"{CONTENT_ROOT}/cache/asmk")
+
+
+@dataclass(frozen=True)
+class CalibrationConfig:
+    sample_size: int = 100
+    seed: int = 0
+    target_aggregation: float = 0.85
+    tau_grid: tuple[float, ...] = (0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9)
+
+
+@dataclass(frozen=True)
+class GroundTruthConfig:
+    oxford_gt_dir: Path = Path(f"{CONTENT_ROOT}/oxford_gt_files")
+    paris_gt_dir: Path = Path(f"{CONTENT_ROOT}/paris_gt_files")
 
 
 @dataclass(frozen=True)
@@ -442,6 +562,8 @@ class ImageDescriptorResult:
     task: ImageDescriptorTask
     db_descriptors: FloatMatrix
     query_descriptors: FloatMatrix
+    n_features: int = 0
+    n_aggregated: int = 0
     skip_reason: str | None = None
 
 
@@ -451,6 +573,8 @@ class PipelineConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     burst: BurstConfig = field(default_factory=BurstConfig)
     asmk: ASMKConfig = field(default_factory=ASMKConfig)
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    ground_truth: GroundTruthConfig = field(default_factory=GroundTruthConfig)
     output_dir: Path = Path(f"{CONTENT_ROOT}/shi_asmk_outputs")
     rebuild_metadata: bool = False
     aggregate_queries: bool = False
@@ -510,11 +634,11 @@ def metadata_to_descriptor_tasks(metadata: pd.DataFrame) -> list[ImageDescriptor
 
 
 def process_image_descriptors(
-    args: tuple[ImageDescriptorTask, FeatureConfig, BurstConfig, bool],
+    args: tuple[ImageDescriptorTask, FeatureConfig, BurstConfig, bool, float],
 ) -> ImageDescriptorResult:
-    task, feature_config, burst_config, aggregate_queries = args
+    task, feature_config, burst_config, aggregate_queries, tau = args
     cv2.setNumThreads(1)
-    sift = create_sift(feature_config)
+    sift = create_sift(feature_config) if feature_config.detector == "sift" else None
     image_path = Path(task.img_path)
 
     features = load_or_extract_rootsift(image_path, sift, feature_config)
@@ -526,20 +650,23 @@ def process_image_descriptors(
             skip_reason="no SIFT features",
         )
 
-    db_descriptors = aggregate_bursts(features, burst_config)
-    query_descriptors = db_descriptors if aggregate_queries else features.descriptors
-    if db_descriptors.shape[0] == 0 or query_descriptors.shape[0] == 0:
+    db_descriptors = aggregate_bursts(features, burst_config, tau=tau)
+    if db_descriptors.shape[0] == 0:
         return ImageDescriptorResult(
             task=task,
             db_descriptors=db_descriptors,
-            query_descriptors=query_descriptors,
+            query_descriptors=empty_feature_set().descriptors,
+            n_features=features.descriptors.shape[0],
+            n_aggregated=db_descriptors.shape[0],
             skip_reason="empty descriptor aggregation",
         )
 
     return ImageDescriptorResult(
         task=task,
         db_descriptors=db_descriptors,
-        query_descriptors=query_descriptors.astype(np.float32),
+        query_descriptors=empty_feature_set().descriptors,
+        n_features=features.descriptors.shape[0],
+        n_aggregated=db_descriptors.shape[0],
     )
 
 
@@ -548,6 +675,7 @@ def iter_descriptor_results(
     feature_config: FeatureConfig,
     burst_config: BurstConfig,
     aggregate_queries: bool,
+    tau_by_dataset: dict[str, float],
     max_workers: int,
     chunksize: int,
 ) -> Iterator[ImageDescriptorResult]:
@@ -555,7 +683,7 @@ def iter_descriptor_results(
         raise ValueError(f"descriptor_chunksize must be >= 1, got {chunksize}")
 
     worker_args = (
-        (task, feature_config, burst_config, aggregate_queries)
+        (task, feature_config, burst_config, aggregate_queries, tau_by_dataset[task.dataset])
         for task in tasks
     )
     if max_workers == 1:
@@ -580,6 +708,7 @@ def build_descriptor_tables(
     feature_config: FeatureConfig,
     burst_config: BurstConfig,
     aggregate_queries: bool,
+    tau_by_dataset: dict[str, float],
     descriptor_workers: int | None = None,
     descriptor_chunksize: int = 4,
 ) -> tuple[pd.DataFrame, DescriptorTable, DescriptorTable]:
@@ -598,6 +727,7 @@ def build_descriptor_tables(
         feature_config,
         burst_config,
         aggregate_queries,
+        tau_by_dataset,
         max_workers=max_workers,
         chunksize=descriptor_chunksize,
     )
@@ -614,12 +744,16 @@ def build_descriptor_tables(
                 "class_name": result.task.class_name,
                 "img_name": result.task.img_name,
                 "img_path": result.task.img_path,
+                "n_features": result.n_features,
+                "n_aggregated": result.n_aggregated,
+                "aggregation_ratio": result.n_aggregated / result.n_features,
             }
         )
         db_descriptor_chunks.append(result.db_descriptors)
         db_id_chunks.append(np.full(result.db_descriptors.shape[0], image_id, dtype=np.int64))
-        query_descriptor_chunks.append(result.query_descriptors)
-        query_id_chunks.append(np.full(result.query_descriptors.shape[0], image_id, dtype=np.int64))
+        if result.query_descriptors.shape[0] > 0:
+            query_descriptor_chunks.append(result.query_descriptors)
+            query_id_chunks.append(np.full(result.query_descriptors.shape[0], image_id, dtype=np.int64))
 
     valid_metadata = pd.DataFrame(valid_records)
     if valid_metadata.empty:
@@ -628,6 +762,90 @@ def build_descriptor_tables(
     db_table = DescriptorTable(stack_or_empty(db_descriptor_chunks), concatenate_ids(db_id_chunks))
     query_table = DescriptorTable(stack_or_empty(query_descriptor_chunks), concatenate_ids(query_id_chunks))
     return valid_metadata, db_table, query_table
+
+
+def calibrate_tau_for_dataset(
+    metadata: pd.DataFrame,
+    dataset_name: str,
+    feature_config: FeatureConfig,
+    burst_config: BurstConfig,
+    calibration_config: CalibrationConfig,
+) -> pd.DataFrame:
+    dataset_metadata = metadata[metadata["dataset"] == dataset_name].reset_index(drop=True)
+    if dataset_metadata.empty:
+        raise ValueError(f"Cannot calibrate tau for empty dataset: {dataset_name}")
+
+    sample_size = min(calibration_config.sample_size, len(dataset_metadata))
+    sample = dataset_metadata.sample(
+        n=sample_size,
+        random_state=calibration_config.seed,
+        replace=False,
+    )
+    sift = create_sift(feature_config) if feature_config.detector == "sift" else None
+    features_per_image: list[FeatureSet] = []
+    for row in tqdm(sample.itertuples(index=False), total=sample_size, desc=f"Calibrate {dataset_name}"):
+        features = load_or_extract_rootsift(Path(row.img_path), sift, feature_config)
+        if features.descriptors.shape[0] > 0:
+            features_per_image.append(features)
+
+    if not features_per_image:
+        raise RuntimeError(f"No valid features found while calibrating dataset: {dataset_name}")
+
+    rows: list[dict[str, object]] = []
+    for tau in calibration_config.tau_grid:
+        ratios: list[float] = []
+        for features in features_per_image:
+            aggregated = aggregate_bursts(features, burst_config, tau=tau)
+            ratios.append(aggregated.shape[0] / features.descriptors.shape[0])
+        aggregation_ratio = float(np.mean(ratios))
+        rows.append(
+            {
+                "dataset": dataset_name,
+                "tau": tau,
+                "aggregation_ratio": aggregation_ratio,
+                "target_aggregation": calibration_config.target_aggregation,
+                "absolute_error": abs(aggregation_ratio - calibration_config.target_aggregation),
+            }
+        )
+
+    calibration = pd.DataFrame(rows)
+    best_idx = calibration["absolute_error"].idxmin()
+    calibration["chosen"] = False
+    calibration.loc[best_idx, "chosen"] = True
+    return calibration
+
+
+def calibrate_taus(
+    metadata: pd.DataFrame,
+    feature_config: FeatureConfig,
+    burst_config: BurstConfig,
+    calibration_config: CalibrationConfig,
+    output_dir: Path,
+) -> dict[str, float]:
+    if burst_config.tau is not None:
+        return {
+            str(dataset): burst_config.tau
+            for dataset in sorted(metadata["dataset"].unique())
+        }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tau_by_dataset: dict[str, float] = {}
+    for dataset in sorted(metadata["dataset"].unique()):
+        calibration = calibrate_tau_for_dataset(
+            metadata,
+            dataset_name=str(dataset),
+            feature_config=feature_config,
+            burst_config=burst_config,
+            calibration_config=calibration_config,
+        )
+        calibration.to_csv(output_dir / f"calibration_{dataset}.csv", index=False)
+        chosen = calibration[calibration["chosen"]].iloc[0]
+        tau_by_dataset[str(dataset)] = float(chosen["tau"])
+        print(
+            f"Calibrated {dataset}: tau={chosen['tau']:.3f}, "
+            f"aggregation%={chosen['aggregation_ratio']:.3f}"
+        )
+    return tau_by_dataset
 
 
 def sample_training_descriptors(descriptors: FloatMatrix, config: PipelineConfig) -> FloatMatrix:
@@ -671,8 +889,11 @@ def train_and_index_asmk(
 ) -> object:
     ASMKMethod = import_asmk_method()
     config.asmk.cache_dir.mkdir(parents=True, exist_ok=True)
-    codebook_path = config.asmk.cache_dir / "codebook.pkl"
-    ivf_path = config.asmk.cache_dir / "ivf.pkl"
+    binary_label = "bin" if config.asmk.binary else "nobin"
+    codebook_path = config.asmk.cache_dir / f"codebook_k{config.asmk.codebook_size}.pkl"
+    ivf_path = config.asmk.cache_dir / (
+        f"ivf_k{config.asmk.codebook_size}_{binary_label}_idf{int(config.asmk.use_idf)}.pkl"
+    )
 
     train_descriptors = sample_training_descriptors(db_table.descriptors, config)
     asmk = ASMKMethod.initialize_untrained(asmk_params(config.asmk))
@@ -688,47 +909,213 @@ def train_and_index_asmk(
 """
 
 
-def average_precision(ranked_ids: IntVector, relevant_ids: set[int]) -> float:
-    if len(relevant_ids) == 0:
+@dataclass(frozen=True)
+class GroundTruthQuery:
+    dataset: str
+    landmark: str
+    query_name: str
+    query_basename: str
+    bbox: tuple[float, float, float, float]
+    positive_ids: set[int]
+    junk_ids: set[int]
+
+
+def image_basename(path_or_name: str) -> str:
+    return Path(path_or_name).stem
+
+
+def strip_query_prefix(name: str) -> str:
+    basename = image_basename(name)
+    for prefix in ("oxc1_",):
+        if basename.startswith(prefix):
+            return basename[len(prefix):]
+    return basename
+
+
+def read_gt_names(path: Path) -> set[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Ground-truth file does not exist: {path}")
+    names: set[str] = set()
+    for line in path.read_text().splitlines():
+        value = line.strip()
+        if value:
+            names.add(image_basename(value))
+    return names
+
+
+def metadata_basename_index(metadata: pd.DataFrame, dataset_name: str) -> dict[str, int]:
+    dataset_metadata = metadata[metadata["dataset"] == dataset_name]
+    index: dict[str, int] = {}
+    for row in dataset_metadata.itertuples(index=False):
+        basename = image_basename(row.img_name)
+        image_id = int(row.image_id)
+        if basename in index:
+            raise ValueError(f"Duplicate image basename in {dataset_name}: {basename}")
+        index[basename] = image_id
+    return index
+
+
+def gt_dir_for_dataset(config: GroundTruthConfig, dataset_name: str) -> Path:
+    if dataset_name == "oxford":
+        return config.oxford_gt_dir
+    if dataset_name == "paris":
+        return config.paris_gt_dir
+    raise ValueError(f"No ground-truth directory configured for dataset: {dataset_name}")
+
+
+def load_ground_truth_for_dataset(
+    metadata: pd.DataFrame,
+    config: GroundTruthConfig,
+    dataset_name: str,
+) -> list[GroundTruthQuery]:
+    gt_dir = gt_dir_for_dataset(config, dataset_name)
+    if not gt_dir.exists():
+        raise FileNotFoundError(f"Ground-truth directory does not exist: {gt_dir}")
+
+    basename_to_id = metadata_basename_index(metadata, dataset_name)
+    queries: list[GroundTruthQuery] = []
+    for query_path in sorted(gt_dir.glob("*_query.txt")):
+        query_name = query_path.name.removesuffix("_query.txt")
+        query_parts = query_path.read_text().split()
+        if len(query_parts) != 5:
+            raise ValueError(f"Invalid query file format: {query_path}")
+
+        query_basename = strip_query_prefix(query_parts[0])
+        if query_basename not in basename_to_id:
+            raise KeyError(f"Query image not found in metadata: {query_basename}")
+        bbox = tuple(float(value) for value in query_parts[1:5])
+        good = read_gt_names(gt_dir / f"{query_name}_good.txt")
+        ok = read_gt_names(gt_dir / f"{query_name}_ok.txt")
+        junk = read_gt_names(gt_dir / f"{query_name}_junk.txt")
+        positives = good.union(ok)
+
+        positive_ids = {
+            basename_to_id[basename]
+            for basename in positives
+            if basename in basename_to_id
+        }
+        junk_ids = {
+            basename_to_id[basename]
+            for basename in junk
+            if basename in basename_to_id
+        }
+        queries.append(
+            GroundTruthQuery(
+                dataset=dataset_name,
+                landmark=query_name.rsplit("_", 1)[0],
+                query_name=query_name,
+                query_basename=query_basename,
+                bbox=bbox,
+                positive_ids=positive_ids,
+                junk_ids=junk_ids,
+            )
+        )
+    if not queries:
+        raise RuntimeError(f"No ground-truth queries found in {gt_dir}")
+    return queries
+
+
+def load_ground_truth_queries(metadata: pd.DataFrame, config: GroundTruthConfig) -> list[GroundTruthQuery]:
+    queries: list[GroundTruthQuery] = []
+    for dataset_name in sorted(metadata["dataset"].unique()):
+        gt_dir = gt_dir_for_dataset(config, str(dataset_name))
+        if gt_dir.exists():
+            queries.extend(load_ground_truth_for_dataset(metadata, config, str(dataset_name)))
+    if not queries:
+        raise RuntimeError("No Oxford/Paris ground-truth query files were found.")
+    return queries
+
+
+def filter_features_by_bbox(features: FeatureSet, bbox: tuple[float, float, float, float]) -> FeatureSet:
+    x1, y1, x2, y2 = bbox
+    in_bbox = (
+        (features.positions[:, 0] >= x1)
+        & (features.positions[:, 0] <= x2)
+        & (features.positions[:, 1] >= y1)
+        & (features.positions[:, 1] <= y2)
+    )
+    return FeatureSet(
+        descriptors=features.descriptors[in_bbox],
+        positions=features.positions[in_bbox],
+        scales=features.scales[in_bbox],
+        orientations=features.orientations[in_bbox],
+        responses=features.responses[in_bbox],
+    )
+
+
+def build_ground_truth_query_table(
+    metadata: pd.DataFrame,
+    queries: list[GroundTruthQuery],
+    feature_config: FeatureConfig,
+) -> DescriptorTable:
+    metadata_by_basename = {
+        (row.dataset, image_basename(row.img_name)): row.img_path
+        for row in metadata.itertuples(index=False)
+    }
+    sift = create_sift(feature_config) if feature_config.detector == "sift" else None
+    descriptor_chunks: list[FloatMatrix] = []
+    query_id_chunks: list[IntVector] = []
+
+    for query_id, query in enumerate(tqdm(queries, desc="Build GT query descriptors")):
+        image_path = metadata_by_basename[(query.dataset, query.query_basename)]
+        features = load_or_extract_rootsift(Path(image_path), sift, feature_config)
+        query_features = filter_features_by_bbox(features, query.bbox)
+        if query_features.descriptors.shape[0] == 0:
+            print(f"[WARN] GT query has no features in bbox: {query.query_name}")
+            continue
+        descriptor_chunks.append(query_features.descriptors)
+        query_id_chunks.append(np.full(query_features.descriptors.shape[0], query_id, dtype=np.int64))
+
+    return DescriptorTable(stack_or_empty(descriptor_chunks), concatenate_ids(query_id_chunks))
+
+
+def average_precision_with_junk(
+    ranked_ids: IntVector,
+    positive_ids: set[int],
+    junk_ids: set[int],
+) -> float:
+    if len(positive_ids) == 0:
         return float("nan")
 
     hits = 0
     precision_sum = 0.0
     seen: set[int] = set()
-    for rank, image_id in enumerate(ranked_ids.tolist(), start=1):
+    effective_rank = 0
+    for image_id in ranked_ids.tolist():
         if image_id in seen:
             continue
         seen.add(image_id)
-        if image_id in relevant_ids:
+        if image_id in junk_ids:
+            continue
+        effective_rank += 1
+        if image_id in positive_ids:
             hits += 1
-            precision_sum += hits / rank
+            precision_sum += hits / effective_rank
 
-    return precision_sum / len(relevant_ids)
+    return precision_sum / len(positive_ids)
 
 
-def evaluate_map(
+def evaluate_ground_truth_map(
     metadata: pd.DataFrame,
+    queries: list[GroundTruthQuery],
     query_ids: IntVector,
     ranks: NDArray[np.int64],
 ) -> pd.DataFrame:
-    metadata_by_id = metadata.set_index("image_id", drop=False)
     rows: list[dict[str, object]] = []
 
     for row_id, query_id in enumerate(query_ids.tolist()):
-        query = metadata_by_id.loc[query_id]
-        relevant = metadata[
-            (metadata["dataset"] == query["dataset"])
-            & (metadata["class_name"] == query["class_name"])
-            & (metadata["image_id"] != query_id)
-        ]["image_id"]
-        ranked_ids = ranks[row_id].astype(np.int64)
-        ranked_ids = ranked_ids[ranked_ids != query_id]
-        ap = average_precision(ranked_ids, set(relevant.astype(int).tolist()))
+        query = queries[query_id]
+        ap = average_precision_with_junk(
+            ranks[row_id].astype(np.int64),
+            query.positive_ids,
+            query.junk_ids,
+        )
         rows.append(
             {
                 "query_id": query_id,
-                "dataset": query["dataset"],
-                "class_name": query["class_name"],
+                "dataset": query.dataset,
+                "query_name": query.query_name,
+                "landmark": query.landmark,
                 "average_precision": ap,
             }
         )
@@ -738,7 +1125,8 @@ def evaluate_map(
         {
             "query_id": -1,
             "dataset": dataset,
-            "class_name": "__mAP__",
+            "query_name": "__mAP__",
+            "landmark": "__mAP__",
             "average_precision": values["average_precision"].mean(skipna=True),
         }
         for dataset, values in ap_df.groupby("dataset")
@@ -747,7 +1135,8 @@ def evaluate_map(
         {
             "query_id": -1,
             "dataset": "combined",
-            "class_name": "__mAP__",
+            "query_name": "__mAP__",
+            "landmark": "__mAP__",
             "average_precision": ap_df["average_precision"].mean(skipna=True),
         }
     )
@@ -770,6 +1159,7 @@ def query_asmk(asmk: object, query_table: DescriptorTable) -> tuple[IntVector, N
 
 def export_retrieval_results(
     metadata: pd.DataFrame,
+    queries: list[GroundTruthQuery],
     query_ids: IntVector,
     ranks: NDArray[np.int64],
     scores: FloatMatrix,
@@ -780,7 +1170,7 @@ def export_retrieval_results(
     rows: list[dict[str, object]] = []
 
     for row_id, query_id in enumerate(query_ids.tolist()):
-        query = metadata_by_id.loc[query_id]
+        query = queries[query_id]
         limit = min(topk, ranks.shape[1])
         for rank_position in range(limit):
             retrieved_id = int(ranks[row_id, rank_position])
@@ -788,13 +1178,15 @@ def export_retrieval_results(
             rows.append(
                 {
                     "query_id": query_id,
-                    "query_path": query["img_path"],
+                    "query_name": query.query_name,
+                    "landmark": query.landmark,
                     "rank": rank_position + 1,
                     "retrieved_id": retrieved_id,
+                    "retrieved_basename": image_basename(retrieved["img_name"]),
                     "retrieved_path": retrieved["img_path"],
                     "score": float(scores[row_id, rank_position]),
-                    "same_dataset": query["dataset"] == retrieved["dataset"],
-                    "same_class": query["class_name"] == retrieved["class_name"],
+                    "is_positive": retrieved_id in query.positive_ids,
+                    "is_junk": retrieved_id in query.junk_ids,
                 }
             )
 
@@ -812,7 +1204,7 @@ def export_metrics(metrics: pd.DataFrame, output_dir: Path) -> Path:
 
 
 def print_map_summary(metrics: pd.DataFrame) -> None:
-    summary = metrics[metrics["class_name"] == "__mAP__"]
+    summary = metrics[metrics["landmark"] == "__mAP__"]
     print("\nmAP summary")
     for row in summary.itertuples(index=False):
         print(f"{row.dataset}: {row.average_precision:.4f}")
@@ -822,11 +1214,19 @@ def run_pipeline(config: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     notify_event("Shi + ASMK retrieval pipeline started.")
     config.output_dir.mkdir(parents=True, exist_ok=True)
     metadata = load_or_build_metadata(config.dataset, rebuild=config.rebuild_metadata)
-    valid_metadata, db_table, query_table = build_descriptor_tables(
+    tau_by_dataset = calibrate_taus(
+        metadata,
+        feature_config=config.features,
+        burst_config=config.burst,
+        calibration_config=config.calibration,
+        output_dir=config.output_dir,
+    )
+    valid_metadata, db_table, _query_table = build_descriptor_tables(
         metadata,
         config.features,
         config.burst,
         aggregate_queries=config.aggregate_queries,
+        tau_by_dataset=tau_by_dataset,
         descriptor_workers=config.descriptor_workers,
         descriptor_chunksize=config.descriptor_chunksize,
     )
@@ -834,15 +1234,17 @@ def run_pipeline(config: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     print(f"Indexed images: {len(valid_metadata)}")
     print(f"Database descriptors after Shi aggregation: {db_table.descriptors.shape[0]}")
-    print(f"Query descriptors: {query_table.descriptors.shape[0]}")
 
     asmk = train_and_index_asmk(db_table, config)
-    query_ids, ranks, scores = query_asmk(asmk, query_table)
-    metrics = evaluate_map(valid_metadata, query_ids, ranks)
+    queries = load_ground_truth_queries(valid_metadata, config.ground_truth)
+    gt_query_table = build_ground_truth_query_table(valid_metadata, queries, config.features)
+    query_ids, ranks, scores = query_asmk(asmk, gt_query_table)
+    metrics = evaluate_ground_truth_map(valid_metadata, queries, query_ids, ranks)
 
     metrics_path = export_metrics(metrics, config.output_dir)
     results_path = export_retrieval_results(
         valid_metadata,
+        queries,
         query_ids,
         ranks,
         scores,

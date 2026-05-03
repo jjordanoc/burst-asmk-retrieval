@@ -1,1 +1,1 @@
-!pip install -U numpy pandas scipy tqdm pyaml faiss-cpu opencv-contrib-python-headless && pip install -e ./asmk
+!pip install -U numpy pandas scipy tqdm pyaml pyhesaff faiss-cpu opencv-contrib-python-headless && pip install -e ./asmk
