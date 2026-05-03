@@ -28,3 +28,4 @@ gpu = [
 
 [tool.uv.sources]
 asmk = { path = "asmk", editable = true }
+pyhesaff = { url = "https://github.com/Erotemic/pyhesaff/releases/download/v2.2.0/pyhesaff-2.2.0-cp310-cp310-manylinux_2_28_x86_64.whl" }
