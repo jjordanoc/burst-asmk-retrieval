@@ -1,8 +1,7 @@
 """
-Shi et al. early burst detection + ASMK image retrieval pipeline.
-
-The file is organized as notebook-ready sections. Run `run_pipeline(PipelineConfig())`
-after the Oxford/Paris archives are available in the configured Colab paths.
+Shi et al. early burst detection + ASMK image retrieval pipeline,
+extended with spatial reranking, average query expansion (AQE),
+and discriminative query expansion (DQE) following Arandjelovic & Zisserman 2012.
 """
 
 from __future__ import annotations
@@ -26,8 +25,8 @@ import pandas as pd
 from numpy.typing import NDArray
 from scipy import sparse
 from scipy.sparse.csgraph import connected_components
+from sklearn.svm import LinearSVC
 from tqdm.auto import tqdm
-
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
@@ -308,11 +307,11 @@ def extract_hesaff_rootsift(image_path: Path, config: FeatureConfig) -> FeatureS
             "Install it or set FeatureConfig(detector='sift')."
         ) from error
     try:
-        result = pyhesaff.detect_feats(str(image_path), threshold=0.5)
+        result = pyhesaff.detect_feats(str(image_path))
     except Exception as error:
         print(f"[WARN] pyhesaff failed to detect features: {error}")
         return empty_feature_set()
-    
+
     if not isinstance(result, tuple) or len(result) < 2:
         raise ValueError(f"pyhesaff returned an invalid feature tuple: {type(result)}")
     keypoints, descriptors = result[:2]
@@ -358,8 +357,6 @@ def extract_features(image_path: Path, sift: cv2.SIFT | None, config: FeatureCon
         return features
     if features.descriptors.shape[0] <= config.max_features_per_image:
         return features
-    # strongest = np.argsort(-features.responses)[: config.max_features_per_image]
-    # strongest.sort()
     return FeatureSet(
         descriptors=features.descriptors,
         positions=features.positions,
@@ -406,12 +403,12 @@ def load_or_extract_rootsift(image_path: Path, sift: cv2.SIFT | None, config: Fe
 @dataclass(frozen=True)
 class BurstConfig:
     tau: float | None = None
-    descriptor_sigmoid_b: float = 0.78  # paper
-    descriptor_sigmoid_w: float = 35.0  # paper
-    use_scale_kernel: bool = True  # paper
-    use_orientation_kernel: bool = True  # paper: Oxford/Paris
-    scale_lambda: float = 1.0  # paper
-    orientation_kappa: float = 4.0  # paper
+    descriptor_sigmoid_b: float = 0.78
+    descriptor_sigmoid_w: float = 35.0
+    use_scale_kernel: bool = True
+    use_orientation_kernel: bool = True
+    scale_lambda: float = 1.0
+    orientation_kappa: float = 4.0
     max_pairwise_features: int | None = None
     cache_dir: Path = Path(f"{CONTENT_ROOT}/cache/bursts")
 
@@ -536,12 +533,6 @@ def burst_tau(config: BurstConfig, fallback_tau: float) -> float:
 
 
 def aggregate_bursts(features: FeatureSet, config: BurstConfig, tau: float | None = None) -> FloatMatrix:
-    """
-    Return Shi-style descriptors with shape [n_aggregated, 128].
-
-    Features are graph nodes. Edges connect pairs whose affinity exceeds the
-    threshold. Each connected component is averaged and L2-normalized.
-    """
     if features.descriptors.shape[0] == 0:
         return features.descriptors
 
@@ -569,15 +560,14 @@ def aggregate_bursts(features: FeatureSet, config: BurstConfig, tau: float | Non
 
 @dataclass(frozen=True)
 class ASMKConfig:
-    codebook_size: int = 65_536  # paper
+    codebook_size: int = 65_536
     gpu_id: int | None = None
-    binary: bool = True  # paper: ASMK*
-    use_idf: bool = True  # paper
-    db_multiple_assignment: int = 1  # paper
-    query_multiple_assignment: int = 5  # paper
-    similarity_threshold: float = 0.0  # paper
-    alpha: float = 3.0  # paper
-    # None = rank full database per query (mAP/eval). Integer = truncate ASMK IVF search depth.
+    binary: bool = True
+    use_idf: bool = True
+    db_multiple_assignment: int = 1
+    query_multiple_assignment: int = 5
+    similarity_threshold: float = 0.0
+    alpha: float = 3.0
     topk: int | None = None
     train_sample_size: int = 250_000
     cache_dir: Path = Path(f"{CONTENT_ROOT}/cache/asmk")
@@ -595,6 +585,29 @@ class CalibrationConfig:
 class GroundTruthConfig:
     oxford_gt_dir: Path = Path(f"{CONTENT_ROOT}/oxford_gt_files")
     paris_gt_dir: Path = Path(f"{CONTENT_ROOT}/paris_gt_files")
+
+
+@dataclass(frozen=True)
+class SpatialRerankConfig:
+    enabled: bool = True
+    top_n: int = 200
+    ratio_test: float = 0.8
+    ransac_threshold: float = 8.0
+    ransac_max_iters: int = 500
+    ransac_confidence: float = 0.99
+    min_inliers: int = 4
+    max_query_descriptors: int = 1500
+    max_candidate_descriptors: int = 3000
+
+
+@dataclass(frozen=True)
+class QueryExpansionConfig:
+    enable_aqe: bool = True
+    enable_dqe: bool = True
+    n_positive: int = 10
+    n_negative: int = 200
+    svm_c: float = 1.0
+    svm_max_iter: int = 2000
 
 
 @dataclass(frozen=True)
@@ -629,11 +642,12 @@ class PipelineConfig:
     asmk: ASMKConfig = field(default_factory=ASMKConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     ground_truth: GroundTruthConfig = field(default_factory=GroundTruthConfig)
+    spatial_rerank: SpatialRerankConfig = field(default_factory=SpatialRerankConfig)
+    query_expansion: QueryExpansionConfig = field(default_factory=QueryExpansionConfig)
     output_dir: Path = Path(f"{CONTENT_ROOT}/shi_asmk_outputs")
     rebuild_metadata: bool = False
     aggregate_queries: bool = False
     random_seed: int = 0
-    # How many retrieval rows per query are written to retrieval_results.csv (and vis.csv cap).
     results_topk: int = 50
     descriptor_workers: int | None = None
     descriptor_chunksize: int = 4
@@ -987,7 +1001,7 @@ def train_and_index_asmk(
 
 
 """
-5. Similarity search and retrieval evaluation
+5. Ground truth and query construction
 """
 
 
@@ -1097,17 +1111,6 @@ def load_ground_truth_for_dataset(
     return queries
 
 
-def load_ground_truth_queries(metadata: pd.DataFrame, config: GroundTruthConfig) -> list[GroundTruthQuery]:
-    queries: list[GroundTruthQuery] = []
-    for dataset_name in sorted(metadata["dataset"].unique()):
-        gt_dir = gt_dir_for_dataset(config, str(dataset_name))
-        if gt_dir.exists():
-            queries.extend(load_ground_truth_for_dataset(metadata, config, str(dataset_name)))
-    if not queries:
-        raise RuntimeError("No Oxford/Paris ground-truth query files were found.")
-    return queries
-
-
 def filter_features_by_bbox(features: FeatureSet, bbox: tuple[float, float, float, float]) -> FeatureSet:
     x1, y1, x2, y2 = bbox
     in_bbox = (
@@ -1125,30 +1128,433 @@ def filter_features_by_bbox(features: FeatureSet, bbox: tuple[float, float, floa
     )
 
 
-def build_ground_truth_query_table(
+@dataclass(frozen=True)
+class QueryFeatureBundle:
+    """Per-query bundle keeping both raw RootSIFT (for SR/DQE) and Shi-aggregated (for ASMK)."""
+    raw_features: FeatureSet
+    aggregated_descriptors: FloatMatrix
+
+
+def build_ground_truth_query_bundles(
     metadata: pd.DataFrame,
     queries: list[GroundTruthQuery],
     feature_config: FeatureConfig,
-) -> DescriptorTable:
+    burst_config: BurstConfig,
+    tau: float,
+) -> list[QueryFeatureBundle]:
     metadata_by_basename = {
         (row.dataset, image_basename(row.img_name)): row.img_path
         for row in metadata.itertuples(index=False)
     }
     sift = create_sift(feature_config) if feature_config.detector == "sift" else None
-    descriptor_chunks: list[FloatMatrix] = []
-    query_id_chunks: list[IntVector] = []
+    bundles: list[QueryFeatureBundle] = []
 
-    for query_id, query in enumerate(tqdm(queries, desc="Build GT query descriptors")):
+    for query in tqdm(queries, desc="Build GT query descriptors"):
         image_path = metadata_by_basename[(query.dataset, query.query_basename)]
         features = load_or_extract_rootsift(Path(image_path), sift, feature_config)
         query_features = filter_features_by_bbox(features, query.bbox)
         if query_features.descriptors.shape[0] == 0:
             print(f"[WARN] GT query has no features in bbox: {query.query_name}")
+            bundles.append(QueryFeatureBundle(empty_feature_set(), empty_feature_set().descriptors))
             continue
-        descriptor_chunks.append(query_features.descriptors)
-        query_id_chunks.append(np.full(query_features.descriptors.shape[0], query_id, dtype=np.int64))
+        aggregated = aggregate_bursts(query_features, burst_config, tau=tau)
+        bundles.append(QueryFeatureBundle(query_features, aggregated))
 
-    return DescriptorTable(stack_or_empty(descriptor_chunks), concatenate_ids(query_id_chunks))
+    return bundles
+
+
+def descriptor_table_from_bundles(bundles: list[QueryFeatureBundle]) -> DescriptorTable:
+    chunks: list[FloatMatrix] = []
+    ids: list[IntVector] = []
+    for query_id, bundle in enumerate(bundles):
+        if bundle.aggregated_descriptors.shape[0] == 0:
+            continue
+        chunks.append(bundle.aggregated_descriptors)
+        ids.append(np.full(bundle.aggregated_descriptors.shape[0], query_id, dtype=np.int64))
+    return DescriptorTable(stack_or_empty(chunks), concatenate_ids(ids))
+
+
+"""
+6. Spatial reranking with RANSAC over RootSIFT
+"""
+
+
+def load_image_features(
+    metadata_row: pd.Series,
+    feature_config: FeatureConfig,
+    sift: cv2.SIFT | None,
+) -> FeatureSet:
+    return load_or_extract_rootsift(Path(metadata_row["img_path"]), sift, feature_config)
+
+
+def match_descriptors_ratio(
+    query_descs: FloatMatrix,
+    candidate_descs: FloatMatrix,
+    ratio: float,
+) -> tuple[IntVector, IntVector]:
+    if query_descs.shape[0] == 0 or candidate_descs.shape[0] < 2:
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
+
+    sims = query_descs @ candidate_descs.T
+    top2 = np.argpartition(-sims, kth=1, axis=1)[:, :2]
+    rows = np.arange(sims.shape[0])[:, None]
+    top2_sims = sims[rows, top2]
+    order = np.argsort(-top2_sims, axis=1)
+    sorted_idx = np.take_along_axis(top2, order, axis=1)
+    sorted_sims = np.take_along_axis(top2_sims, order, axis=1)
+
+    best_sim = np.clip(sorted_sims[:, 0], -1.0, 1.0)
+    second_sim = np.clip(sorted_sims[:, 1], -1.0, 1.0)
+    best_dist = np.sqrt(np.maximum(2.0 - 2.0 * best_sim, 0.0))
+    second_dist = np.sqrt(np.maximum(2.0 - 2.0 * second_sim, 0.0))
+    keep = best_dist < ratio * np.maximum(second_dist, 1e-6)
+
+    q_idx = np.nonzero(keep)[0].astype(np.int64)
+    c_idx = sorted_idx[keep, 0].astype(np.int64)
+    return q_idx, c_idx
+
+
+def count_ransac_inliers(
+    query_features: FeatureSet,
+    candidate_features: FeatureSet,
+    sr_config: SpatialRerankConfig,
+) -> int:
+    q_descs = query_features.descriptors
+    c_descs = candidate_features.descriptors
+
+    if q_descs.shape[0] > sr_config.max_query_descriptors:
+        order = np.argsort(-query_features.responses)[: sr_config.max_query_descriptors]
+        q_descs = q_descs[order]
+        q_pts = query_features.positions[order]
+    else:
+        q_pts = query_features.positions
+
+    if c_descs.shape[0] > sr_config.max_candidate_descriptors:
+        order = np.argsort(-candidate_features.responses)[: sr_config.max_candidate_descriptors]
+        c_descs = c_descs[order]
+        c_pts = candidate_features.positions[order]
+    else:
+        c_pts = candidate_features.positions
+
+    q_idx, c_idx = match_descriptors_ratio(q_descs, c_descs, sr_config.ratio_test)
+    if q_idx.shape[0] < sr_config.min_inliers:
+        return 0
+
+    src_pts = q_pts[q_idx].astype(np.float32)
+    dst_pts = c_pts[c_idx].astype(np.float32)
+    _, mask = cv2.findHomography(
+        src_pts, dst_pts, cv2.RANSAC,
+        sr_config.ransac_threshold,
+        maxIters=sr_config.ransac_max_iters,
+        confidence=sr_config.ransac_confidence,
+    )
+    if mask is None:
+        return 0
+    inliers = int(mask.sum())
+    return inliers if inliers >= sr_config.min_inliers else 0
+
+
+def spatial_rerank_topk(
+    query_features: FeatureSet,
+    initial_ranking: NDArray[np.int64],
+    metadata: pd.DataFrame,
+    feature_config: FeatureConfig,
+    sr_config: SpatialRerankConfig,
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    if not sr_config.enabled or query_features.descriptors.shape[0] == 0:
+        return initial_ranking, np.zeros_like(initial_ranking)
+
+    sift = create_sift(feature_config) if feature_config.detector == "sift" else None
+    metadata_by_id = metadata.set_index("image_id", drop=False)
+
+    top_n = min(sr_config.top_n, initial_ranking.shape[0])
+    candidates = initial_ranking[:top_n]
+    inliers = np.zeros(initial_ranking.shape[0], dtype=np.int64)
+
+    for i, cand_id in enumerate(candidates.tolist()):
+        cand_row = metadata_by_id.loc[cand_id]
+        cand_features = load_image_features(cand_row, feature_config, sift)
+        if cand_features.descriptors.shape[0] == 0:
+            continue
+        inliers[i] = count_ransac_inliers(query_features, cand_features, sr_config)
+
+    verified_mask = inliers[:top_n] > 0
+    verified_ids = candidates[verified_mask]
+    verified_inliers = inliers[:top_n][verified_mask]
+    order = np.argsort(-verified_inliers, kind="stable")
+    verified_ids = verified_ids[order]
+
+    not_verified_ids = candidates[~verified_mask]
+    rest_ids = initial_ranking[top_n:]
+
+    final_ranking = np.concatenate([verified_ids, not_verified_ids, rest_ids]).astype(np.int64)
+    return final_ranking, inliers
+
+
+"""
+7. Query expansion: AQE and DQE in ASMK descriptor / codebook spaces
+"""
+
+
+def query_asmk(asmk: object, query_table: DescriptorTable) -> tuple[IntVector, NDArray[np.int64], FloatMatrix]:
+    _metadata, query_ids, ranks, scores = asmk.query_ivf(
+        query_table.descriptors,
+        query_table.image_ids,
+        progress=500,
+    )
+    return query_ids.astype(np.int64), ranks.astype(np.int64), scores.astype(np.float32)
+
+
+def aggregated_descriptors_for_image(
+    image_id: int,
+    db_table: DescriptorTable,
+) -> FloatMatrix:
+    mask = db_table.image_ids == image_id
+    return db_table.descriptors[mask]
+
+
+def average_query_expansion(
+    asmk: object,
+    query_aggregated: FloatMatrix,
+    verified_ids: NDArray[np.int64],
+    db_table: DescriptorTable,
+    n_positive: int,
+) -> tuple[NDArray[np.int64], FloatMatrix]:
+    expand_ids = verified_ids[:n_positive]
+    chunks: list[FloatMatrix] = [query_aggregated]
+    for image_id in expand_ids.tolist():
+        chunks.append(aggregated_descriptors_for_image(int(image_id), db_table))
+
+    expanded_descs = stack_or_empty(chunks)
+    if expanded_descs.shape[0] == 0:
+        return np.empty((0,), dtype=np.int64), np.empty((0, 0), dtype=np.float32)
+
+    expanded_descs = l2_normalize_rows(expanded_descs)
+    expanded_ids = np.zeros(expanded_descs.shape[0], dtype=np.int64)
+    expanded_table = DescriptorTable(expanded_descs, expanded_ids)
+    _qids, ranks, scores = query_asmk(asmk, expanded_table)
+    return ranks[0].astype(np.int64), scores[0:1].astype(np.float32)
+
+
+def hard_assign_to_codebook(
+    asmk: object,
+    descriptors: FloatMatrix,
+) -> IntVector:
+    if descriptors.shape[0] == 0:
+        return np.empty((0,), dtype=np.int64)
+    codebook = asmk.codebook
+    centroids = codebook.centroids if hasattr(codebook, "centroids") else codebook["centroids"]
+    centroids = np.asarray(centroids, dtype=np.float32)
+    sims = descriptors @ centroids.T
+    return np.argmax(sims, axis=1).astype(np.int64)
+
+
+def bow_tfidf_for_image(
+    image_id: int,
+    db_table: DescriptorTable,
+    asmk: object,
+    vocab_size: int,
+    idf: FloatVector,
+) -> FloatVector:
+    descs = aggregated_descriptors_for_image(image_id, db_table)
+    if descs.shape[0] == 0:
+        return np.zeros(vocab_size, dtype=np.float32)
+    words = hard_assign_to_codebook(asmk, descs)
+    tf = np.zeros(vocab_size, dtype=np.float32)
+    unique, counts = np.unique(words, return_counts=True)
+    tf[unique] = counts
+    vec = tf * idf
+    norm = np.linalg.norm(vec)
+    return vec / max(norm, 1e-12)
+
+
+def compute_idf_from_db(
+    db_table: DescriptorTable,
+    asmk: object,
+    vocab_size: int,
+) -> FloatVector:
+    all_words = hard_assign_to_codebook(asmk, db_table.descriptors)
+    n_images = int(db_table.image_ids.max()) + 1 if db_table.image_ids.size > 0 else 0
+    if n_images == 0:
+        return np.ones(vocab_size, dtype=np.float32)
+
+    word_image_pairs = np.stack([all_words, db_table.image_ids], axis=1)
+    unique_pairs = np.unique(word_image_pairs, axis=0)
+    doc_freq = np.zeros(vocab_size, dtype=np.float32)
+    word_unique, word_counts = np.unique(unique_pairs[:, 0], return_counts=True)
+    doc_freq[word_unique] = word_counts.astype(np.float32)
+    return (np.log((n_images + 1) / (doc_freq + 1)) + 1.0).astype(np.float32)
+
+
+def discriminative_query_expansion(
+    asmk: object,
+    query_aggregated: FloatMatrix,
+    verified_ids: NDArray[np.int64],
+    initial_ranking: NDArray[np.int64],
+    initial_scores: FloatVector,
+    db_table: DescriptorTable,
+    bow_idf: FloatVector,
+    qe_config: QueryExpansionConfig,
+    vocab_size: int,
+) -> NDArray[np.int64]:
+    pos_ids = verified_ids[: qe_config.n_positive]
+    if pos_ids.shape[0] == 0:
+        return initial_ranking
+
+    candidate_pool = initial_ranking[~np.isin(initial_ranking, pos_ids)]
+    candidate_scores = initial_scores[~np.isin(initial_ranking, pos_ids)]
+    nonzero_mask = candidate_scores > 0
+    candidate_pool = candidate_pool[nonzero_mask]
+    candidate_scores = candidate_scores[nonzero_mask]
+    neg_order = np.argsort(candidate_scores, kind="stable")
+    neg_ids = candidate_pool[neg_order[: qe_config.n_negative]]
+
+    pos_vectors = np.vstack([
+        bow_tfidf_for_image(int(i), db_table, asmk, vocab_size, bow_idf)
+        for i in pos_ids.tolist()
+    ])
+    neg_vectors = np.vstack([
+        bow_tfidf_for_image(int(i), db_table, asmk, vocab_size, bow_idf)
+        for i in neg_ids.tolist()
+    ]) if neg_ids.shape[0] > 0 else np.empty((0, vocab_size), dtype=np.float32)
+
+    query_words = hard_assign_to_codebook(asmk, query_aggregated)
+    query_tf = np.zeros(vocab_size, dtype=np.float32)
+    if query_words.size > 0:
+        unique, counts = np.unique(query_words, return_counts=True)
+        query_tf[unique] = counts
+    query_vec = query_tf * bow_idf
+    query_vec = query_vec / max(np.linalg.norm(query_vec), 1e-12)
+
+    pos_words_set: set[int] = set()
+    for vec in pos_vectors:
+        pos_words_set.update(np.nonzero(vec)[0].tolist())
+    pos_words_set.update(np.nonzero(query_vec)[0].tolist())
+    pos_words = np.array(sorted(pos_words_set), dtype=np.int64)
+    if pos_words.size == 0:
+        return initial_ranking
+
+    X_pos = pos_vectors[:, pos_words]
+    X_neg = neg_vectors[:, pos_words] if neg_vectors.shape[0] > 0 else np.empty((0, pos_words.size), dtype=np.float32)
+    X_query = query_vec[pos_words].reshape(1, -1)
+    X = np.vstack([X_pos, X_query, X_neg])
+    y = np.concatenate([
+        np.ones(X_pos.shape[0] + 1, dtype=np.float32),
+        np.zeros(X_neg.shape[0], dtype=np.float32),
+    ])
+
+    if np.unique(y).size < 2:
+        return initial_ranking
+
+    svm = LinearSVC(C=qe_config.svm_c, max_iter=qe_config.svm_max_iter)
+    svm.fit(X, y)
+    weights = svm.coef_.ravel().astype(np.float32)
+
+    n_images = int(db_table.image_ids.max()) + 1 if db_table.image_ids.size > 0 else 0
+    db_scores = np.zeros(n_images, dtype=np.float32)
+    for image_id in range(n_images):
+        vec = bow_tfidf_for_image(image_id, db_table, asmk, vocab_size, bow_idf)
+        db_scores[image_id] = float(weights @ vec[pos_words])
+
+    return np.argsort(-db_scores, kind="stable").astype(np.int64)
+
+
+"""
+8. End-to-end retrieval and evaluation
+"""
+
+
+@dataclass(frozen=True)
+class RetrievalOutput:
+    method: str
+    query_ids: IntVector
+    rankings: NDArray[np.int64]
+    scores: FloatMatrix
+
+
+def run_retrieval_methods(
+    asmk: object,
+    metadata: pd.DataFrame,
+    db_table: DescriptorTable,
+    queries: list[GroundTruthQuery],
+    query_bundles: list[QueryFeatureBundle],
+    config: PipelineConfig,
+) -> list[RetrievalOutput]:
+    n_images = int(metadata["image_id"].max()) + 1
+    vocab_size = config.asmk.codebook_size
+
+    needs_dqe = config.query_expansion.enable_dqe
+    bow_idf = compute_idf_from_db(db_table, asmk, vocab_size) if needs_dqe else np.ones(vocab_size, dtype=np.float32)
+
+    baseline_query_ids: list[int] = []
+    baseline_ranks: list[NDArray[np.int64]] = []
+    baseline_scores: list[FloatVector] = []
+    sr_ranks: list[NDArray[np.int64]] = []
+    aqe_ranks: list[NDArray[np.int64]] = []
+    aqe_scores: list[FloatVector] = []
+    dqe_ranks: list[NDArray[np.int64]] = []
+
+    for query_id, (query, bundle) in enumerate(tqdm(
+        list(zip(queries, query_bundles)), desc="Retrieve per query",
+    )):
+        if bundle.aggregated_descriptors.shape[0] == 0:
+            continue
+
+        single_table = DescriptorTable(
+            bundle.aggregated_descriptors,
+            np.zeros(bundle.aggregated_descriptors.shape[0], dtype=np.int64),
+        )
+        _qid, ranks, scores = query_asmk(asmk, single_table)
+        baseline_query_ids.append(query_id)
+        initial_ranking = ranks[0]
+        initial_scores = scores[0]
+        baseline_ranks.append(initial_ranking)
+        baseline_scores.append(initial_scores)
+
+        sr_ranking, _inliers = spatial_rerank_topk(
+            bundle.raw_features, initial_ranking, metadata,
+            config.features, config.spatial_rerank,
+        )
+        sr_ranks.append(sr_ranking)
+        verified_ids = sr_ranking[: config.spatial_rerank.top_n]
+
+        if config.query_expansion.enable_aqe:
+            aqe_ranking, aqe_score = average_query_expansion(
+                asmk, bundle.aggregated_descriptors, verified_ids,
+                db_table, config.query_expansion.n_positive,
+            )
+            aqe_ranks.append(aqe_ranking)
+            aqe_scores.append(aqe_score[0] if aqe_score.size > 0 else np.zeros(n_images, dtype=np.float32))
+        if config.query_expansion.enable_dqe:
+            dqe_ranking = discriminative_query_expansion(
+                asmk, bundle.aggregated_descriptors, verified_ids,
+                initial_ranking, initial_scores, db_table, bow_idf,
+                config.query_expansion, vocab_size,
+            )
+            dqe_ranks.append(dqe_ranking)
+
+    query_ids_array = np.array(baseline_query_ids, dtype=np.int64)
+    outputs = [
+        RetrievalOutput("baseline_asmk", query_ids_array,
+                        np.stack(baseline_ranks) if baseline_ranks else np.empty((0, n_images), dtype=np.int64),
+                        np.stack(baseline_scores) if baseline_scores else np.empty((0, n_images), dtype=np.float32)),
+        RetrievalOutput("asmk_sr", query_ids_array,
+                        np.stack(sr_ranks) if sr_ranks else np.empty((0, n_images), dtype=np.int64),
+                        np.stack(baseline_scores) if baseline_scores else np.empty((0, n_images), dtype=np.float32)),
+    ]
+    if config.query_expansion.enable_aqe and aqe_ranks:
+        outputs.append(RetrievalOutput(
+            "asmk_sr_aqe", query_ids_array,
+            np.stack(aqe_ranks),
+            np.stack(aqe_scores),
+        ))
+    if config.query_expansion.enable_dqe and dqe_ranks:
+        outputs.append(RetrievalOutput(
+            "asmk_sr_dqe", query_ids_array,
+            np.stack(dqe_ranks),
+            np.zeros((len(dqe_ranks), n_images), dtype=np.float32),
+        ))
+    return outputs
 
 
 def average_precision_with_junk(
@@ -1177,98 +1583,76 @@ def average_precision_with_junk(
     return precision_sum / len(positive_ids)
 
 
-def evaluate_ground_truth_map(
-    metadata: pd.DataFrame,
+def evaluate_method(
+    method: str,
     queries: list[GroundTruthQuery],
     query_ids: IntVector,
     ranks: NDArray[np.int64],
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-
     for row_id, query_id in enumerate(query_ids.tolist()):
         query = queries[query_id]
-        ap = average_precision_with_junk(
-            ranks[row_id].astype(np.int64),
-            query.positive_ids,
-            query.junk_ids,
-        )
-        rows.append(
-            {
-                "query_id": query_id,
-                "dataset": query.dataset,
-                "query_name": query.query_name,
-                "landmark": query.landmark,
-                "average_precision": ap,
-            }
-        )
-
+        ap = average_precision_with_junk(ranks[row_id].astype(np.int64), query.positive_ids, query.junk_ids)
+        rows.append({
+            "method": method,
+            "query_id": query_id,
+            "dataset": query.dataset,
+            "query_name": query.query_name,
+            "landmark": query.landmark,
+            "average_precision": ap,
+        })
     ap_df = pd.DataFrame(rows)
     if ap_df.empty:
         return ap_df
     dataset_name = ap_df["dataset"].iloc[0]
-    map_row = pd.DataFrame(
-        [
-            {
-                "query_id": -1,
-                "dataset": dataset_name,
-                "query_name": "__mAP__",
-                "landmark": "__mAP__",
-                "average_precision": ap_df["average_precision"].mean(skipna=True),
-            }
-        ]
-    )
+    map_row = pd.DataFrame([{
+        "method": method,
+        "query_id": -1,
+        "dataset": dataset_name,
+        "query_name": "__mAP__",
+        "landmark": "__mAP__",
+        "average_precision": ap_df["average_precision"].mean(skipna=True),
+    }])
     return pd.concat([ap_df, map_row], ignore_index=True)
 
 
-def query_asmk(asmk: object, query_table: DescriptorTable) -> tuple[IntVector, NDArray[np.int64], FloatMatrix]:
-    _metadata, query_ids, ranks, scores = asmk.query_ivf(
-        query_table.descriptors,
-        query_table.image_ids,
-        progress=500,
-    )
-    return query_ids.astype(np.int64), ranks.astype(np.int64), scores.astype(np.float32)
-
-
 """
-6. Retrieval output
+9. Output / reporting
 """
 
 
 def export_retrieval_results(
     metadata: pd.DataFrame,
     queries: list[GroundTruthQuery],
-    query_ids: IntVector,
-    ranks: NDArray[np.int64],
-    scores: FloatMatrix,
+    output: RetrievalOutput,
     output_dir: Path,
     topk: int,
 ) -> Path:
     metadata_by_id = metadata.set_index("image_id", drop=False)
     rows: list[dict[str, object]] = []
 
-    for row_id, query_id in enumerate(query_ids.tolist()):
+    for row_id, query_id in enumerate(output.query_ids.tolist()):
         query = queries[query_id]
-        limit = min(topk, ranks.shape[1])
+        limit = min(topk, output.rankings.shape[1])
         for rank_position in range(limit):
-            retrieved_id = int(ranks[row_id, rank_position])
+            retrieved_id = int(output.rankings[row_id, rank_position])
             retrieved = metadata_by_id.loc[retrieved_id]
-            rows.append(
-                {
-                    "query_id": query_id,
-                    "query_name": query.query_name,
-                    "landmark": query.landmark,
-                    "rank": rank_position + 1,
-                    "retrieved_id": retrieved_id,
-                    "retrieved_basename": image_basename(retrieved["img_name"]),
-                    "retrieved_path": retrieved["img_path"],
-                    "score": float(scores[row_id, rank_position]),
-                    "is_positive": retrieved_id in query.positive_ids,
-                    "is_junk": retrieved_id in query.junk_ids,
-                }
-            )
+            rows.append({
+                "method": output.method,
+                "query_id": query_id,
+                "query_name": query.query_name,
+                "landmark": query.landmark,
+                "rank": rank_position + 1,
+                "retrieved_id": retrieved_id,
+                "retrieved_basename": image_basename(retrieved["img_name"]),
+                "retrieved_path": retrieved["img_path"],
+                "score": float(output.scores[row_id, rank_position]) if output.scores.size > 0 else 0.0,
+                "is_positive": retrieved_id in query.positive_ids,
+                "is_junk": retrieved_id in query.junk_ids,
+            })
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "retrieval_results.csv"
+    output_path = output_dir / f"retrieval_results_{output.method}.csv"
     pd.DataFrame(rows).to_csv(output_path, index=False)
     return output_path
 
@@ -1283,11 +1667,11 @@ def export_metrics(metrics: pd.DataFrame, output_dir: Path) -> Path:
 def print_map_summary(metrics: pd.DataFrame) -> None:
     summary = metrics[metrics["landmark"] == "__mAP__"]
     print("\nmAP summary")
-    for row in summary.itertuples(index=False):
-        print(f"{row.dataset}: {row.average_precision:.4f}")
+    pivot = summary.pivot(index="method", columns="dataset", values="average_precision")
+    print(pivot.to_string(float_format=lambda v: f"{v:.4f}"))
 
 
-def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
+def run_pipeline(config: PipelineConfig) -> dict[str, pd.DataFrame]:
     notify_event("Shi + ASMK retrieval pipeline started.")
     config.output_dir.mkdir(parents=True, exist_ok=True)
     metadata = load_or_build_metadata(config.dataset, rebuild=config.rebuild_metadata)
@@ -1299,8 +1683,6 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
         output_dir=config.output_dir,
     )
 
-    # Feature extraction / burst aggregation over the full unified metadata.
-    # Image-level caches are keyed by file path, so this is dataset-independent.
     full_valid_metadata, _full_db_table, _full_query_table = build_descriptor_tables(
         metadata,
         config.features,
@@ -1312,9 +1694,8 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
     )
     full_valid_metadata.to_csv(config.output_dir / "valid_metadata.csv", index=False)
 
-    # Run each dataset as a fully independent benchmark.
     dataset_names = sorted(full_valid_metadata["dataset"].unique())
-    results_by_dataset: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    metrics_by_dataset: dict[str, pd.DataFrame] = {}
 
     for dataset_name in dataset_names:
         print(f"\n{'='*60}")
@@ -1322,7 +1703,6 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
         print(f"{'='*60}")
 
         ds_metadata = full_valid_metadata[full_valid_metadata["dataset"] == dataset_name].copy()
-        # Re-index image IDs from 0..N-1 within this dataset.
         ds_metadata = ds_metadata.reset_index(drop=True)
         ds_metadata["image_id"] = ds_metadata.index.astype(np.int64)
 
@@ -1330,8 +1710,7 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
         ds_output_dir.mkdir(parents=True, exist_ok=True)
         ds_metadata.to_csv(ds_output_dir / "valid_metadata.csv", index=False)
 
-        # Build a dataset-scoped descriptor table with local image IDs.
-        ds_db_table = build_descriptor_tables(
+        ds_valid_metadata, ds_db, _ = build_descriptor_tables(
             ds_metadata,
             config.features,
             config.burst,
@@ -1340,7 +1719,6 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
             descriptor_workers=config.descriptor_workers,
             descriptor_chunksize=config.descriptor_chunksize,
         )
-        ds_valid_metadata, ds_db, _ds_query = ds_db_table
 
         print(f"[{dataset_name}] Indexed images: {len(ds_valid_metadata)}")
         print(f"[{dataset_name}] Database descriptors after Shi aggregation: {ds_db.descriptors.shape[0]}")
@@ -1353,28 +1731,28 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
             continue
 
         queries = load_ground_truth_for_dataset(ds_valid_metadata, config.ground_truth, dataset_name)
-        gt_query_table = build_ground_truth_query_table(ds_valid_metadata, queries, config.features)
-        query_ids, ranks, scores = query_asmk(asmk, gt_query_table)
-        metrics = evaluate_ground_truth_map(ds_valid_metadata, queries, query_ids, ranks)
-
-        metrics_path = export_metrics(metrics, ds_output_dir)
-        results_path = export_retrieval_results(
-            ds_valid_metadata,
-            queries,
-            query_ids,
-            ranks,
-            scores,
-            ds_output_dir,
-            topk=config.results_topk,
+        query_bundles = build_ground_truth_query_bundles(
+            ds_valid_metadata, queries, config.features, config.burst, tau_by_dataset[dataset_name],
         )
 
-        print_map_summary(metrics)
+        outputs = run_retrieval_methods(
+            asmk, ds_valid_metadata, ds_db, queries, query_bundles, config,
+        )
+
+        all_metrics_chunks: list[pd.DataFrame] = []
+        for output in outputs:
+            metrics = evaluate_method(output.method, queries, output.query_ids, output.rankings)
+            all_metrics_chunks.append(metrics)
+            export_retrieval_results(ds_valid_metadata, queries, output, ds_output_dir, topk=config.results_topk)
+
+        all_metrics = pd.concat(all_metrics_chunks, ignore_index=True)
+        metrics_path = export_metrics(all_metrics, ds_output_dir)
+        print_map_summary(all_metrics)
         print(f"[{dataset_name}] Metrics saved to: {metrics_path}")
-        print(f"[{dataset_name}] Retrieval results saved to: {results_path}")
-        results_by_dataset[dataset_name] = (metrics, ds_valid_metadata)
+        metrics_by_dataset[dataset_name] = all_metrics
 
     notify_event("Shi + ASMK retrieval pipeline finished.")
-    return results_by_dataset
+    return metrics_by_dataset
 
 
 if __name__ == "__main__":
@@ -1383,11 +1761,8 @@ if __name__ == "__main__":
         descriptor_chunksize=4,
         asmk=ASMKConfig(
             gpu_id=0,
-            # gpu_id=None,
             codebook_size=65536,
-            # codebook_size=16384,
             train_sample_size=2_600_000,
-            # train_sample_size=700_000,
         ),
-        burst=BurstConfig(tau=0.99999),
+        burst=BurstConfig(tau=0.990),
     ))

@@ -308,7 +308,7 @@ def extract_hesaff_rootsift(image_path: Path, config: FeatureConfig) -> FeatureS
             "Install it or set FeatureConfig(detector='sift')."
         ) from error
     try:
-        result = pyhesaff.detect_feats(str(image_path), threshold=0.5)
+        result = pyhesaff.detect_feats(str(image_path))
     except Exception as error:
         print(f"[WARN] pyhesaff failed to detect features: {error}")
         return empty_feature_set()
@@ -967,14 +967,13 @@ def asmk_params(config: ASMKConfig) -> dict[str, object]:
 def train_and_index_asmk(
     db_table: DescriptorTable,
     config: PipelineConfig,
-    dataset_name: str,
 ) -> object:
     ASMKMethod = import_asmk_method()
     config.asmk.cache_dir.mkdir(parents=True, exist_ok=True)
     binary_label = "bin" if config.asmk.binary else "nobin"
-    codebook_path = config.asmk.cache_dir / f"codebook_k{config.asmk.codebook_size}_{dataset_name}.pkl"
+    codebook_path = config.asmk.cache_dir / f"codebook_k{config.asmk.codebook_size}.pkl"
     ivf_path = config.asmk.cache_dir / (
-        f"ivf_k{config.asmk.codebook_size}_{binary_label}_idf{int(config.asmk.use_idf)}_{dataset_name}.pkl"
+        f"ivf_k{config.asmk.codebook_size}_{binary_label}_idf{int(config.asmk.use_idf)}.pkl"
     )
 
     train_descriptors = sample_training_descriptors(db_table.descriptors, config)
@@ -1203,21 +1202,26 @@ def evaluate_ground_truth_map(
         )
 
     ap_df = pd.DataFrame(rows)
-    if ap_df.empty:
-        return ap_df
-    dataset_name = ap_df["dataset"].iloc[0]
-    map_row = pd.DataFrame(
-        [
-            {
-                "query_id": -1,
-                "dataset": dataset_name,
-                "query_name": "__mAP__",
-                "landmark": "__mAP__",
-                "average_precision": ap_df["average_precision"].mean(skipna=True),
-            }
-        ]
+    dataset_rows = [
+        {
+            "query_id": -1,
+            "dataset": dataset,
+            "query_name": "__mAP__",
+            "landmark": "__mAP__",
+            "average_precision": values["average_precision"].mean(skipna=True),
+        }
+        for dataset, values in ap_df.groupby("dataset")
+    ]
+    dataset_rows.append(
+        {
+            "query_id": -1,
+            "dataset": "combined",
+            "query_name": "__mAP__",
+            "landmark": "__mAP__",
+            "average_precision": ap_df["average_precision"].mean(skipna=True),
+        }
     )
-    return pd.concat([ap_df, map_row], ignore_index=True)
+    return pd.concat([ap_df, pd.DataFrame(dataset_rows)], ignore_index=True)
 
 
 def query_asmk(asmk: object, query_table: DescriptorTable) -> tuple[IntVector, NDArray[np.int64], FloatMatrix]:
@@ -1287,7 +1291,7 @@ def print_map_summary(metrics: pd.DataFrame) -> None:
         print(f"{row.dataset}: {row.average_precision:.4f}")
 
 
-def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
+def run_pipeline(config: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     notify_event("Shi + ASMK retrieval pipeline started.")
     config.output_dir.mkdir(parents=True, exist_ok=True)
     metadata = load_or_build_metadata(config.dataset, rebuild=config.rebuild_metadata)
@@ -1298,10 +1302,7 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
         calibration_config=config.calibration,
         output_dir=config.output_dir,
     )
-
-    # Feature extraction / burst aggregation over the full unified metadata.
-    # Image-level caches are keyed by file path, so this is dataset-independent.
-    full_valid_metadata, _full_db_table, _full_query_table = build_descriptor_tables(
+    valid_metadata, db_table, _query_table = build_descriptor_tables(
         metadata,
         config.features,
         config.burst,
@@ -1310,71 +1311,33 @@ def run_pipeline(config: PipelineConfig) -> dict[str, tuple[pd.DataFrame, pd.Dat
         descriptor_workers=config.descriptor_workers,
         descriptor_chunksize=config.descriptor_chunksize,
     )
-    full_valid_metadata.to_csv(config.output_dir / "valid_metadata.csv", index=False)
+    valid_metadata.to_csv(config.output_dir / "valid_metadata.csv", index=False)
 
-    # Run each dataset as a fully independent benchmark.
-    dataset_names = sorted(full_valid_metadata["dataset"].unique())
-    results_by_dataset: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    print(f"Indexed images: {len(valid_metadata)}")
+    print(f"Database descriptors after Shi aggregation: {db_table.descriptors.shape[0]}")
 
-    for dataset_name in dataset_names:
-        print(f"\n{'='*60}")
-        print(f"  Running independent benchmark: {dataset_name}")
-        print(f"{'='*60}")
+    asmk = train_and_index_asmk(db_table, config)
+    queries = load_ground_truth_queries(valid_metadata, config.ground_truth)
+    gt_query_table = build_ground_truth_query_table(valid_metadata, queries, config.features)
+    query_ids, ranks, scores = query_asmk(asmk, gt_query_table)
+    metrics = evaluate_ground_truth_map(valid_metadata, queries, query_ids, ranks)
 
-        ds_metadata = full_valid_metadata[full_valid_metadata["dataset"] == dataset_name].copy()
-        # Re-index image IDs from 0..N-1 within this dataset.
-        ds_metadata = ds_metadata.reset_index(drop=True)
-        ds_metadata["image_id"] = ds_metadata.index.astype(np.int64)
+    metrics_path = export_metrics(metrics, config.output_dir)
+    results_path = export_retrieval_results(
+        valid_metadata,
+        queries,
+        query_ids,
+        ranks,
+        scores,
+        config.output_dir,
+        topk=config.results_topk,
+    )
 
-        ds_output_dir = config.output_dir / dataset_name
-        ds_output_dir.mkdir(parents=True, exist_ok=True)
-        ds_metadata.to_csv(ds_output_dir / "valid_metadata.csv", index=False)
-
-        # Build a dataset-scoped descriptor table with local image IDs.
-        ds_db_table = build_descriptor_tables(
-            ds_metadata,
-            config.features,
-            config.burst,
-            aggregate_queries=config.aggregate_queries,
-            tau_by_dataset=tau_by_dataset,
-            descriptor_workers=config.descriptor_workers,
-            descriptor_chunksize=config.descriptor_chunksize,
-        )
-        ds_valid_metadata, ds_db, _ds_query = ds_db_table
-
-        print(f"[{dataset_name}] Indexed images: {len(ds_valid_metadata)}")
-        print(f"[{dataset_name}] Database descriptors after Shi aggregation: {ds_db.descriptors.shape[0]}")
-
-        asmk = train_and_index_asmk(ds_db, config, dataset_name=dataset_name)
-
-        gt_dir = gt_dir_for_dataset(config.ground_truth, dataset_name)
-        if not gt_dir.exists():
-            print(f"[{dataset_name}] No ground-truth directory found at {gt_dir}, skipping evaluation.")
-            continue
-
-        queries = load_ground_truth_for_dataset(ds_valid_metadata, config.ground_truth, dataset_name)
-        gt_query_table = build_ground_truth_query_table(ds_valid_metadata, queries, config.features)
-        query_ids, ranks, scores = query_asmk(asmk, gt_query_table)
-        metrics = evaluate_ground_truth_map(ds_valid_metadata, queries, query_ids, ranks)
-
-        metrics_path = export_metrics(metrics, ds_output_dir)
-        results_path = export_retrieval_results(
-            ds_valid_metadata,
-            queries,
-            query_ids,
-            ranks,
-            scores,
-            ds_output_dir,
-            topk=config.results_topk,
-        )
-
-        print_map_summary(metrics)
-        print(f"[{dataset_name}] Metrics saved to: {metrics_path}")
-        print(f"[{dataset_name}] Retrieval results saved to: {results_path}")
-        results_by_dataset[dataset_name] = (metrics, ds_valid_metadata)
-
+    print_map_summary(metrics)
+    print(f"Metrics saved to: {metrics_path}")
+    print(f"Retrieval results saved to: {results_path}")
     notify_event("Shi + ASMK retrieval pipeline finished.")
-    return results_by_dataset
+    return metrics, valid_metadata
 
 
 if __name__ == "__main__":
@@ -1389,5 +1352,5 @@ if __name__ == "__main__":
             train_sample_size=2_600_000,
             # train_sample_size=700_000,
         ),
-        burst=BurstConfig(tau=0.99999),
+        burst=BurstConfig(tau=0.990),
     ))

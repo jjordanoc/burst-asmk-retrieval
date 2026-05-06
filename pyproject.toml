@@ -8,6 +8,7 @@ dependencies = [
     "asmk",
     "gradio>=4",
     "kagglehub>=1.0.1",
+    "matplotlib>=3.7",
     "marker-pdf>=1.10.2",
     "numpy<2",
     "opencv-contrib-python-headless",

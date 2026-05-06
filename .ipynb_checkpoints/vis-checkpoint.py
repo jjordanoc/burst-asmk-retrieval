@@ -48,13 +48,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv",
         type=str,
-        default="content/shi_asmk_outputs/codebook_65k_joaquin_latest/oxford/retrieval_results.csv",
+        default="content/shi_asmk_outputs/retrieval_results.csv",
         help="Path to retrieval_results.csv (relative to project root unless absolute).",
     )
     parser.add_argument(
         "--metadata",
         type=str,
-        default="content/shi_asmk_outputs/codebook_65k_joaquin_latest/oxford/valid_metadata.csv",
+        default="content/shi_asmk_outputs/valid_metadata.csv",
         help="Dataset metadata CSV with columns dataset, img_name, img_path (matching the retrieval run).",
     )
     parser.add_argument(
@@ -153,11 +153,10 @@ def render_query_roi(
     metadata_df: pd.DataFrame,
     max_side: int | None = 900,
     border_px: int = 3,
-    ap_val: float | None = None,
 ) -> tuple[Image.Image, str]:
     """Draw GT bounding box on the query image."""
     if not queries:
-        return query_placeholder_image("Ground-truth list not loaded."), "*Query ROI unavailable.*"
+        return query_placeholder_image("Ground-truth query list not loaded."), "*Query ROI unavailable.*"
     if query_id < 0 or query_id >= len(queries):
         return query_placeholder_image("Invalid query index."), "*Invalid query id.*"
 
@@ -214,9 +213,8 @@ def render_query_roi(
         nw, nh = int(qw * scale), int(qh * scale)
         overlay = overlay.resize((nw, nh), Image.Resampling.LANCZOS)
 
-    ap_str = f" · **AP**: `{ap_val:.3f}`" if ap_val is not None and pd.notna(ap_val) else ""
     caption = (
-        f"**Query** · **{dataset}** · `{getattr(query, 'query_name')}` · `{qbase}`{ap_str}\n\n"
+        f"**Query** · **{dataset}** · `{getattr(query, 'query_name')}` · `{qbase}`\n\n"
         f"GT ROI (pixels, full-res image): `{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}`"
     )
     return overlay, caption
@@ -397,11 +395,6 @@ def export_ranking_pdf(
     query_row_meta = df.loc[df["query_id"] == q_id].iloc[0]
     query_display_name = str(query_row_meta["query_name"])
 
-    ap_str = ""
-    if "average_precision" in query_row_meta and pd.notna(query_row_meta["average_precision"]):
-        ap = float(query_row_meta["average_precision"])
-        ap_str = f" (AP: {ap:.3f})"
-
     q_pil, _ = render_query_roi(
         q_id,
         gt_queries,
@@ -411,18 +404,11 @@ def export_ranking_pdf(
 
     nc = min(5, len(rows))
     nr = math.ceil(len(rows) / nc)
-    
-    # Calculate paper-friendly dimensions (e.g. CVPR/ICCV double column width is ~6.875 inches)
-    fig_w = 6.875
-    hr_query = 2.2
-    hr_retrieval = 1.2 * nr
-    fig_h = hr_query + hr_retrieval + 0.6  # padding for titles
-    
-    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=False)
+    fig = plt.figure(figsize=(8.27, 11.69), constrained_layout=False)
     fig.suptitle(
-        f"{query_display_name} — top-{len(rows)} retrievals{ap_str}",
+        f"{query_display_name} — top-{len(rows)} retrievals",
         fontsize=12,
-        weight="bold",
+        weight="medium",
         y=0.98,
     )
 
@@ -430,25 +416,25 @@ def export_ranking_pdf(
         2,
         1,
         figure=fig,
-        height_ratios=[hr_query, hr_retrieval],
-        hspace=0.15,
-        top=0.90,
-        bottom=0.02,
-        left=0.02,
-        right=0.98,
+        height_ratios=[0.42, 0.56],
+        hspace=0.18,
+        top=0.93,
+        bottom=0.04,
+        left=0.06,
+        right=0.94,
     )
 
     ax_q = fig.add_subplot(gs[0])
     ax_q.imshow(np.asarray(q_pil))
     ax_q.set_axis_off()
-    # ax_q.set_title("Query (GT region of interest)", loc="center", pad=6)
+    ax_q.set_title("Query (GT region of interest)", loc="center", pad=6)
 
     inner = gridspec.GridSpecFromSubplotSpec(
         nr,
         nc,
         subplot_spec=gs[1],
-        wspace=0.08,
-        hspace=0.25,
+        wspace=0.12,
+        hspace=0.35,
     )
 
     for i, (_, row) in enumerate(rows.iterrows()):
@@ -461,7 +447,7 @@ def export_ranking_pdf(
         ax.imshow(np.asarray(pil_r))
         ax.set_axis_off()
         ax.set_title(
-            rf"#{int(row['rank'])}",
+            rf"#{int(row['rank'])} ({tag})\n{row['retrieved_basename']}",
             fontsize=8,
             color="0.05",
         )
@@ -482,20 +468,6 @@ def main() -> None:
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     df = pd.read_csv(csv_path)
-    
-    # Try to load mAP metrics if available in the same directory
-    metrics_path = csv_path.parent / "map_metrics.csv"
-    if metrics_path.is_file():
-        try:
-            metrics_df = pd.read_csv(metrics_path)
-            if "query_id" in metrics_df.columns and "average_precision" in metrics_df.columns:
-                metrics_df["query_id"] = pd.to_numeric(metrics_df["query_id"], errors="coerce")
-                metrics_df = metrics_df.dropna(subset=["query_id"])
-                metrics_df["query_id"] = metrics_df["query_id"].astype(int)
-                df = df.merge(metrics_df[["query_id", "average_precision"]], on="query_id", how="left")
-        except Exception as e:
-            print(f"Warning: could not load {metrics_path}: {e}")
-
     df["query_id"] = pd.to_numeric(df["query_id"], errors="raise").astype(int)
     df["rank"] = pd.to_numeric(df["rank"], errors="raise").astype(int)
     df["score"] = pd.to_numeric(df["score"], errors="raise")
@@ -624,12 +596,7 @@ def main() -> None:
         def _update(choice: str, k_raw: float):
             k = _clamp_k(k_raw)
             qid = parse_query_id_from_choice(choice)
-            ap_val = None
-            if "average_precision" in df.columns:
-                q_rows = df.loc[df["query_id"] == qid]
-                if not q_rows.empty:
-                    ap_val = q_rows.iloc[0]["average_precision"]
-            q_pil, q_md = render_query_roi(qid, gt_queries, metadata_df, args.query_max_side, ap_val=ap_val)
+            q_pil, q_md = render_query_roi(qid, gt_queries, metadata_df, args.query_max_side)
             imgs, md5 = gallery_for_choice(df, choice, args.border, k)
             return q_md, q_pil, md5, imgs
 
